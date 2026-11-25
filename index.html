@@ -10,12 +10,10 @@
   <link rel="stylesheet" href="css/styles.css" />
 </head>
 <body>
-  <!-- Capas de fondo personalizables desde Admin -->
   <div id="bg-image"></div>
   <div id="bg-overlay"></div>
   <div class="bg-grid"></div>
 
-  <!-- Barra de navegación -->
   <header class="navbar">
     <div class="container nav-inner">
       <button class="brand" onclick="App.switchView('store')">
@@ -39,18 +37,20 @@
         <div class="hero-text">
           <span class="badge">RECARGAS RÁPIDAS Y SEGURAS</span>
           <h1>Recarga tus juegos favoritos en minutos</h1>
-          <p>Selecciona tu juego, ingresa tu ID, elige tu paquete y paga con Pago Móvil, Zinli, PayPal o Binance.</p>
+          <p>Inicia sesión, elige tu juego y paquete, paga con Pago Móvil, Binance, PayPal o Zinli y envía tu comprobante directo a nuestro WhatsApp.</p>
         </div>
         <div class="hero-meta">
           <div class="rate-pill">
             <span>Tasa del día</span>
-            <strong id="display-rate">1 USD = 0.00 Bs</strong>
+            <strong id="display-rate">1 USD = -- Bs</strong>
           </div>
           <input type="search" id="search-games" class="input" placeholder="Buscar juego..." oninput="App.renderStore()" />
         </div>
       </div>
 
-      <div id="games-grid" class="games-grid"></div>
+      <div id="games-grid" class="games-grid">
+        <div class="glass" style="padding:26px;grid-column:1/-1;text-align:center;">Cargando catálogo...</div>
+      </div>
     </section>
 
     <!-- VISTA 2: HISTORIAL DE RECARGAS -->
@@ -58,7 +58,7 @@
       <div class="section-header">
         <div>
           <h2>Mis Recargas</h2>
-          <p class="muted" id="history-subtitle">Inicia sesión para guardar y consultar tu historial.</p>
+          <p class="muted" id="history-subtitle">Inicia sesión para consultar tu historial guardado en la nube.</p>
         </div>
         <button class="btn btn-outline" onclick="App.switchView('store')">← Volver a la tienda</button>
       </div>
@@ -70,10 +70,10 @@
       <div class="section-header">
         <div>
           <h2>Panel de Administración</h2>
-          <p class="muted">Gestiona juegos, paquetes, imágenes, métodos de pago, pedidos y apariencia.</p>
+          <p class="muted">Todos los cambios se guardan automáticamente en la nube (D1 + R2).</p>
         </div>
         <div class="row-actions">
-          <button class="btn btn-primary" onclick="App.downloadDataJs()">⬇ Descargar data.js</button>
+          <button class="btn btn-outline" onclick="App.refreshAdminOrders()">↻ Actualizar Pedidos</button>
           <button class="btn btn-danger" onclick="App.lockAdmin()">🔒 Bloquear Admin</button>
         </div>
       </div>
@@ -103,7 +103,7 @@
         <div class="step active" data-step="1"><span>1</span> Tu ID</div>
         <div class="step" data-step="2"><span>2</span> Paquete</div>
         <div class="step" data-step="3"><span>3</span> Pago</div>
-        <div class="step" data-step="4"><span>4</span> Listo</div>
+        <div class="step" data-step="4"><span>4</span> WhatsApp</div>
       </div>
 
       <div id="checkout-body" class="checkout-body"></div>
@@ -127,17 +127,13 @@
       <form onsubmit="App.submitAdminLogin(event)">
         <label class="field-label">Contraseña</label>
         <input type="password" id="admin-pass-input" class="input" placeholder="Contraseña..." required />
-        <p class="hint">Contraseña inicial: <code>arcan2026</code> (cámbiala en Apariencia y Seguridad)</p>
-        <button type="submit" class="btn btn-primary full-width" style="margin-top: 14px;">Desbloquear Panel</button>
+        <button type="submit" class="btn btn-primary full-width" style="margin-top: 16px;">Desbloquear Panel</button>
       </form>
     </div>
   </div>
 
-  <!-- NOTIFICACIONES -->
   <div id="toast-container" class="toast-container"></div>
 
-  <!-- Scripts (data.js SIEMPRE antes que app.js) -->
-  <script src="js/data.js"></script>
   <script src="js/app.js"></script>
 </body>
 </html>
