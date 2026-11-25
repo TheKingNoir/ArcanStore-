@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ArcanStore — Recargas Gaming</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Orbitron:wght@600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="css/styles.css" />
+</head>
+<body>
+  <!-- Capas de fondo personalizables desde Admin -->
+  <div id="bg-image"></div>
+  <div id="bg-overlay"></div>
+  <div class="bg-grid"></div>
+
+  <!-- Barra de navegación -->
+  <header class="navbar">
+    <div class="container nav-inner">
+      <button class="brand" onclick="App.switchView('store')">
+        <span class="brand-dot"></span>
+        <span>ARCAN<strong>STORE</strong></span>
+      </button>
+
+      <nav class="nav-links">
+        <button class="nav-btn active" data-view="store" onclick="App.switchView('store')">Tienda</button>
+        <button class="nav-btn" data-view="history" onclick="App.switchView('history')">Mis Recargas</button>
+        <button class="nav-btn" id="btn-auth" onclick="App.openAuthModal()">Iniciar Sesión</button>
+        <button class="nav-btn nav-admin" data-view="admin" onclick="App.requestAdminAccess()">🔒 Admin</button>
+      </nav>
+    </div>
+  </header>
+
+  <main class="container main-content">
+    <!-- VISTA 1: TIENDA -->
+    <section id="view-store" class="view active">
+      <div class="hero glass">
+        <div class="hero-text">
+          <span class="badge">RECARGAS RÁPIDAS Y SEGURAS</span>
+          <h1>Recarga tus juegos favoritos en minutos</h1>
+          <p>Selecciona tu juego, ingresa tu ID, elige tu paquete y paga con Pago Móvil, Zinli, PayPal o Binance.</p>
+        </div>
+        <div class="hero-meta">
+          <div class="rate-pill">
+            <span>Tasa del día</span>
+            <strong id="display-rate">1 USD = 0.00 Bs</strong>
+          </div>
+          <input type="search" id="search-games" class="input" placeholder="Buscar juego..." oninput="App.renderStore()" />
+        </div>
+      </div>
+
+      <div id="games-grid" class="games-grid"></div>
+    </section>
+
+    <!-- VISTA 2: HISTORIAL DE RECARGAS -->
+    <section id="view-history" class="view">
+      <div class="section-header">
+        <div>
+          <h2>Mis Recargas</h2>
+          <p class="muted" id="history-subtitle">Inicia sesión para guardar y consultar tu historial.</p>
+        </div>
+        <button class="btn btn-outline" onclick="App.switchView('store')">← Volver a la tienda</button>
+      </div>
+      <div id="history-list" class="history-list"></div>
+    </section>
+
+    <!-- VISTA 3: PANEL DE ADMINISTRACIÓN -->
+    <section id="view-admin" class="view">
+      <div class="section-header">
+        <div>
+          <h2>Panel de Administración</h2>
+          <p class="muted">Gestiona juegos, paquetes, imágenes, métodos de pago, pedidos y apariencia.</p>
+        </div>
+        <div class="row-actions">
+          <button class="btn btn-primary" onclick="App.downloadDataJs()">⬇ Descargar data.js</button>
+          <button class="btn btn-danger" onclick="App.lockAdmin()">🔒 Bloquear Admin</button>
+        </div>
+      </div>
+
+      <div class="admin-tabs">
+        <button class="tab-btn active" data-tab="games" onclick="App.switchAdminTab('games')">Juegos y Paquetes</button>
+        <button class="tab-btn" data-tab="payments" onclick="App.switchAdminTab('payments')">Pagos y Tasa</button>
+        <button class="tab-btn" data-tab="orders" onclick="App.switchAdminTab('orders')">Pedidos</button>
+        <button class="tab-btn" data-tab="appearance" onclick="App.switchAdminTab('appearance')">Apariencia y Seguridad</button>
+      </div>
+
+      <div id="admin-tab-content" class="admin-panel glass"></div>
+    </section>
+  </main>
+
+  <!-- MODAL: FLUJO DE RECARGA (4 PASOS) -->
+  <div id="modal-checkout" class="modal-backdrop">
+    <div class="modal glass checkout-modal">
+      <div class="checkout-banner" id="checkout-banner">
+        <button class="modal-close" onclick="App.closeModal('modal-checkout')">✕</button>
+        <span class="badge" id="checkout-tag">POPULAR</span>
+        <h3 id="checkout-game-title">Juego</h3>
+        <p id="checkout-game-sub">Recarga directa</p>
+      </div>
+
+      <div class="stepper" id="checkout-stepper">
+        <div class="step active" data-step="1"><span>1</span> Tu ID</div>
+        <div class="step" data-step="2"><span>2</span> Paquete</div>
+        <div class="step" data-step="3"><span>3</span> Pago</div>
+        <div class="step" data-step="4"><span>4</span> Listo</div>
+      </div>
+
+      <div id="checkout-body" class="checkout-body"></div>
+    </div>
+  </div>
+
+  <!-- MODAL: LOGIN / REGISTRO -->
+  <div id="modal-auth" class="modal-backdrop">
+    <div class="modal glass small-modal">
+      <button class="modal-close" onclick="App.closeModal('modal-auth')">✕</button>
+      <div id="auth-modal-content"></div>
+    </div>
+  </div>
+
+  <!-- MODAL: CONTRASEÑA ADMIN -->
+  <div id="modal-admin-login" class="modal-backdrop">
+    <div class="modal glass small-modal">
+      <button class="modal-close" onclick="App.closeModal('modal-admin-login')">✕</button>
+      <h3>Acceso de Administrador</h3>
+      <p class="muted" style="margin: 6px 0 16px;">Ingresa tu contraseña maestra para editar la tienda.</p>
+      <form onsubmit="App.submitAdminLogin(event)">
+        <label class="field-label">Contraseña</label>
+        <input type="password" id="admin-pass-input" class="input" placeholder="Contraseña..." required />
+        <p class="hint">Contraseña inicial: <code>arcan2026</code> (cámbiala en Apariencia y Seguridad)</p>
+        <button type="submit" class="btn btn-primary full-width" style="margin-top: 14px;">Desbloquear Panel</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- NOTIFICACIONES -->
+  <div id="toast-container" class="toast-container"></div>
+
+  <!-- Scripts (data.js SIEMPRE antes que app.js) -->
+  <script src="js/data.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
