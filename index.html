@@ -43,7 +43,7 @@
         <div class="hero-text">
           <span class="badge">RECARGAS RÁPIDAS Y SEGURAS</span>
           <h1>Recarga tus juegos favoritos en minutos</h1>
-          <p>Inicia sesión, elige tu juego y paquete, paga con Pago Móvil, Binance, PayPal o Zinli y envía tu comprobante directo a nuestro WhatsApp.</p>
+          <p>Inicia sesión, elige tu juego y paquete, aplica tu código de descuento o referido, paga con Pago Móvil, Binance, PayPal o Zinli y sube de nivel.</p>
         </div>
         <div class="hero-meta">
           <div class="rate-pill">
@@ -67,7 +67,7 @@
             <h2>Noticias y Anuncios</h2>
             <span id="ws-status" class="ws-pill ws-connecting">● Conectando...</span>
           </div>
-          <p class="muted">Novedades oficiales de ArcanStore en tiempo real. Reacciona, comenta y etiqueta a otros jugadores con @.</p>
+          <p class="muted">Novedades oficiales de ArcanStore en tiempo real. Reacciona, comenta, etiqueta con @ y comparte.</p>
         </div>
         <button class="btn btn-outline" onclick="App.loadNews(true)">↻ Actualizar</button>
       </div>
@@ -88,12 +88,12 @@
       <div id="history-list" class="history-list"></div>
     </section>
 
-    <!-- VISTA 4: PERSONALIZACIÓN DE PERFIL -->
+    <!-- VISTA 4: PERSONALIZACIÓN DE PERFIL Y NIVELES -->
     <section id="view-profile" class="view">
       <div class="section-header">
         <div>
           <h2>Mi Perfil</h2>
-          <p class="muted">Personaliza tu foto con zoom, bio, género, cumpleaños y edad gratis, o solicita cambio de nombre ($5 USD).</p>
+          <p class="muted">Tu nivel de recargas con marco exclusivo, foto con zoom, bio, género, cumpleaños y cambio de nombre ($5 USD).</p>
         </div>
         <button class="btn btn-outline" onclick="App.switchView('store')">← Volver a la tienda</button>
       </div>
@@ -117,6 +117,7 @@
         <button class="tab-btn active" data-tab="games" onclick="App.switchAdminTab('games')">Juegos y Paquetes</button>
         <button class="tab-btn" data-tab="news" onclick="App.switchAdminTab('news')">Noticias</button>
         <button class="tab-btn" data-tab="payments" onclick="App.switchAdminTab('payments')">Pagos y Tasa</button>
+        <button class="tab-btn" data-tab="promos" onclick="App.switchAdminTab('promos')">Códigos / Referidos</button>
         <button class="tab-btn" data-tab="orders" onclick="App.switchAdminTab('orders')">Pedidos</button>
         <button class="tab-btn" data-tab="namechanges" onclick="App.switchAdminTab('namechanges')">Cambios de Nombre</button>
         <button class="tab-btn" data-tab="appearance" onclick="App.switchAdminTab('appearance')">Apariencia y Seguridad</button>
@@ -167,6 +168,14 @@
         </div>
       </div>
       <div id="notifications-list" class="notifications-list"></div>
+    </div>
+  </div>
+
+  <!-- MODAL: COMPARTIR NOTICIA -->
+  <div id="modal-share-news" class="modal-backdrop">
+    <div class="modal glass small-modal">
+      <button class="modal-close" onclick="App.closeModal('modal-share-news')">✕</button>
+      <div id="share-news-content"></div>
     </div>
   </div>
 
@@ -226,6 +235,38 @@
       </form>
     </div>
   </div>
+
+  <!-- BOTÓN FLOTANTE Y CHAT DE SOPORTE IA -->
+  <button type="button" id="support-fab" class="support-fab" onclick="App.toggleSupportChat()" aria-label="Chat de soporte IA" title="Soporte IA">
+    <span class="support-fab-icon">💬</span>
+    <span class="support-fab-label">Soporte IA</span>
+  </button>
+
+  <aside id="support-chat-widget" class="support-widget glass" aria-label="Asistente de soporte ArcanStore">
+    <div class="support-header">
+      <div class="support-title-wrap">
+        <span class="support-avatar">🤖</span>
+        <div>
+          <strong>Soporte IA</strong>
+          <div class="support-status">● En línea 24/7</div>
+        </div>
+      </div>
+      <button type="button" class="support-close" onclick="App.toggleSupportChat()" aria-label="Cerrar chat">✕</button>
+    </div>
+
+    <div class="support-quick-row">
+      <button type="button" class="support-quick-btn" onclick="App.sendQuickSupport('¿Cómo hago una recarga paso a paso?')">¿Cómo recargo?</button>
+      <button type="button" class="support-quick-btn" onclick="App.sendQuickSupport('¿Cuál es la tasa del día y métodos de pago?')">Tasa y pagos</button>
+      <button type="button" class="support-quick-btn" onclick="App.sendQuickSupport('¿Cómo funciona el sistema de niveles y los 20 días?')">Niveles</button>
+    </div>
+
+    <div id="support-chat-messages" class="support-messages"></div>
+
+    <form class="support-input-form" onsubmit="App.sendSupportMessage(event)">
+      <input type="text" id="support-chat-input" class="input" placeholder="Escribe tu pregunta..." maxlength="500" autocomplete="off" />
+      <button type="submit" id="support-chat-send" class="btn btn-primary btn-sm">Enviar</button>
+    </form>
+  </aside>
 
   <div id="toast-container" class="toast-container"></div>
 
