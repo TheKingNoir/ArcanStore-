@@ -13,14 +13,25 @@ const App = {
   adminNameChanges: [],
   pendingGameId: null,
 
+  /* WebSocket en tiempo real */
+  ws: null,
+  wsStatus: "connecting",
+  wsReconnectTimer: null,
+  wsPingTimer: null,
+  wsBackoffMs: 1200,
+
+  /* Notificaciones */
+  notifications: [],
+  unreadCount: 0,
+
   /* Noticias, comentarios y perfiles públicos */
   newsList: [],
   newsEmojis: ["🔥", "❤️", "🎮", "😮", "👍", "😂"],
+  commentEmojis: ["❤️", "🔥", "😂", "😮", "👍"],
   openNewsComments: {},
   newsCommentsCache: {},
   replyState: {},
   publicUsers: [],
-  mentionState: {},
 
   /* Editor de noticias en Admin */
   newsEditor: {
@@ -37,7 +48,21 @@ const App = {
   profileData: {
     requests: [],
     uploadingAvatar: false,
-    savingBio: false
+    savingProfile: false
+  },
+
+  /* Recortador de avatar con zoom y arrastre */
+  cropper: {
+    img: null,
+    zoom: 1,
+    offsetX: 0,
+    offsetY: 0,
+    baseScale: 1,
+    dragging: false,
+    startX: 0,
+    startY: 0,
+    saving: false,
+    bound: false
   },
 
   /* Modal de cambio de nombre ($5 USD) */
@@ -68,10 +93,23 @@ const App = {
   },
 
   async init() {
+    this.bindCropperEvents();
     await Promise.all([this.loadStore(), this.restoreUserSession(), this.loadPublicUsers()]);
     this.applyAppearance();
     this.updateAuthButton();
+    this.updateNotifUI();
     this.renderStore();
+
+    if (this.currentUser && this.userToken) {
+      this.loadNotifications();
+    }
+    this.connectWebSocket();
+
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible" && (!this.ws || this.ws.readyState !== WebSocket.OPEN)) {
+        this.connectWebSocket();
+      }
+    });
   },
 
   async api(endpoint, { method = "GET", body = null, token = null, isForm = false } = {}) {
@@ -154,7 +192,7 @@ const App = {
     el.className = "toast";
     el.textContent = msg;
     container.appendChild(el);
-    setTimeout(() => el.remove(), 3400);
+    setTimeout(() => el.remove(), 3600);
   },
 
   formatUsd(n) { return `$${Number(n || 0).toFixed(2)}`; },
@@ -166,6 +204,388 @@ const App = {
 
   formatDate(iso) {
     try { return new Date(iso).toLocaleString("es-VE"); } catch { return iso; }
+  },
+
+  formatBirthday(bday) {
+    if (!bday || !/^\d{4}-\d{2}-\d{2}$/.test(bday)) return "";
+    const [y, m, d] = bday.split("-").map(Number);
+    const months = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"];
+    return `${d} de ${months[m - 1] || m} (${y})`;
+  },
+
+  calculateAgeLocal(bday) {
+    if (!bday || !/^\d{4}-\d{2}-\d{2}$/.test(bday)) return "";
+    const [y, m, d] = bday.split("-").map(Number);
+    const now = new Date();
+    let age = now.getFullYear() - y;
+    const md = (now.getMonth() + 1) - m;
+    if (md < 0 || (md === 0 && now.getDate() < d)) age--;
+    return age >= 10 && age <= 120 ? age : "";
+  },
+
+  /* ================= WEBSOCKET EN TIEMPO REAL ================= */
+  setWsStatus(status) {
+    this.wsStatus = status;
+    const pill = document.getElementById("ws-status");
+    if (!pill) return;
+    pill.className = `ws-pill ws-${status}`;
+    pill.textContent =
+      status === "online" ? "● En vivo" :
+      status === "connecting" ? "● Conectando..." :
+      "● Reconectando...";
+  },
+
+  connectWebSocket() {
+    clearTimeout(this.wsReconnectTimer);
+    clearInterval(this.wsPingTimer);
+
+    if (this.ws) {
+      try {
+        this.ws.onclose = null;
+        this.ws.close();
+      } catch {}
+      this.ws = null;
+    }
+
+    this.setWsStatus("connecting");
+
+    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const qs = this.userToken ? `?token=${encodeURIComponent(this.userToken)}` : "";
+    const url = `${proto}//${window.location.host}/api/ws${qs}`;
+
+    try {
+      const socket = new WebSocket(url);
+      this.ws = socket;
+
+      socket.onopen = () => {
+        this.wsBackoffMs = 1200;
+        this.setWsStatus("online");
+        this.wsPingTimer = setInterval(() => {
+          if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            try { this.ws.send("ping"); } catch {}
+          }
+        }, 25000);
+      };
+
+      socket.onmessage = (e) => {
+        try {
+          const event = JSON.parse(e.data);
+          this.handleRealtimeEvent(event);
+        } catch {}
+      };
+
+      socket.onerror = () => {
+        try { socket.close(); } catch {}
+      };
+
+      socket.onclose = () => {
+        clearInterval(this.wsPingTimer);
+        this.setWsStatus("offline");
+        const wait = Math.min(this.wsBackoffMs, 15000);
+        this.wsBackoffMs = Math.round(wait * 1.6);
+        this.wsReconnectTimer = setTimeout(() => this.connectWebSocket(), wait);
+      };
+    } catch {
+      this.setWsStatus("offline");
+    }
+  },
+
+  handleRealtimeEvent(ev) {
+    if (!ev || !ev.type || ev.type === "pong") return;
+
+    if (ev.type === "news_reaction") {
+      const item = this.newsList.find(n => n.id === ev.newsId);
+      if (!item || !ev.counts) return;
+      for (const emoji of this.newsEmojis) {
+        if (!item.reactions[emoji]) item.reactions[emoji] = { count: 0, reacted: false };
+        if (ev.counts[emoji] !== undefined) item.reactions[emoji].count = Number(ev.counts[emoji]);
+      }
+      const box = document.getElementById(`news-reactions-${ev.newsId}`);
+      if (box) box.innerHTML = this.renderNewsReactionsHtml(item);
+      return;
+    }
+
+    if (ev.type === "comment_created") {
+      const { newsId, comment } = ev;
+      if (!comment) return;
+      const item = this.newsList.find(n => n.id === newsId);
+
+      if (this.newsCommentsCache[newsId]) {
+        const exists = this.newsCommentsCache[newsId].some(c => c.id === comment.id);
+        if (!exists) {
+          this.newsCommentsCache[newsId].push(comment);
+          if (item) item.comments_count = this.newsCommentsCache[newsId].length;
+        }
+      } else if (item) {
+        item.comments_count = Number(item.comments_count || 0) + 1;
+      }
+
+      const countEl = document.getElementById(`news-comment-count-${newsId}`);
+      if (countEl && item) countEl.textContent = item.comments_count;
+
+      // Actualiza SOLO la lista de comentarios sin tocar el textarea donde escribe el usuario
+      if (this.openNewsComments[newsId]) {
+        const listEl = document.getElementById(`comments-list-${newsId}`);
+        if (listEl) listEl.innerHTML = this.renderCommentsListOnly(newsId);
+      }
+      return;
+    }
+
+    if (ev.type === "comment_deleted") {
+      const { newsId, commentId } = ev;
+      const item = this.newsList.find(n => n.id === newsId);
+      if (this.newsCommentsCache[newsId]) {
+        this.newsCommentsCache[newsId] = this.newsCommentsCache[newsId].filter(
+          c => c.id !== commentId && c.parent_id !== commentId
+        );
+        if (item) item.comments_count = this.newsCommentsCache[newsId].length;
+      } else if (item && item.comments_count > 0) {
+        item.comments_count--;
+      }
+
+      const countEl = document.getElementById(`news-comment-count-${newsId}`);
+      if (countEl && item) countEl.textContent = item.comments_count;
+
+      if (this.openNewsComments[newsId]) {
+        const listEl = document.getElementById(`comments-list-${newsId}`);
+        if (listEl) listEl.innerHTML = this.renderCommentsListOnly(newsId);
+      }
+      return;
+    }
+
+    if (ev.type === "comment_reaction") {
+      const { newsId, commentId, counts } = ev;
+      const list = this.newsCommentsCache[newsId];
+      if (!list || !counts) return;
+      const comment = list.find(c => c.id === commentId);
+      if (!comment) return;
+      if (!comment.reactions) comment.reactions = {};
+      for (const emoji of this.commentEmojis) {
+        if (!comment.reactions[emoji]) comment.reactions[emoji] = { count: 0, reacted: false };
+        if (counts[emoji] !== undefined) comment.reactions[emoji].count = Number(counts[emoji]);
+      }
+      const box = document.getElementById(`comment-reactions-${commentId}`);
+      if (box) box.innerHTML = this.renderCommentReactionsHtml(comment);
+      return;
+    }
+
+    if (ev.type === "news_created") {
+      if (ev.news && !this.newsList.some(n => n.id === ev.news.id)) {
+        if (ev.news.pinned) {
+          this.newsList.unshift(ev.news);
+        } else {
+          const firstUnpinned = this.newsList.findIndex(n => !n.pinned);
+          if (firstUnpinned === -1) this.newsList.push(ev.news);
+          else this.newsList.splice(firstUnpinned, 0, ev.news);
+        }
+
+        const feed = document.getElementById("news-feed");
+        if (feed && document.getElementById("view-news")?.classList.contains("active")) {
+          const isTyping = document.activeElement?.tagName === "TEXTAREA";
+          if (!isTyping) this.renderNewsFeed();
+          else {
+            const temp = document.createElement("div");
+            temp.innerHTML = this.renderSingleNewsCard(ev.news);
+            feed.prepend(temp.firstElementChild);
+          }
+        }
+      }
+
+      if (this.currentUser && this.userToken) {
+        this.loadNotifications();
+        this.toast(`📰 ${ev.message || "Nueva noticia publicada en ArcanStore"}`);
+      }
+      return;
+    }
+
+    if (ev.type === "news_updated" || ev.type === "news_deleted") {
+      if (document.getElementById("view-news")?.classList.contains("active")) {
+        const isTyping = document.activeElement?.tagName === "TEXTAREA";
+        if (!isTyping) this.loadNews(false);
+      }
+      return;
+    }
+
+    if (ev.type === "notification" && ev.notification) {
+      if (!this.currentUser) return;
+      if (!this.notifications.some(n => n.id === ev.notification.id)) {
+        this.notifications.unshift(ev.notification);
+        this.unreadCount++;
+      }
+      this.updateNotifUI();
+      this.toast(`🔔 ${ev.notification.message}`);
+      if (document.getElementById("modal-notifications")?.classList.contains("open")) {
+        this.renderNotificationsList();
+      }
+      return;
+    }
+
+    if (ev.type === "name_changed" && this.currentUser && ev.userId === this.currentUser.id) {
+      this.currentUser.name = ev.newName;
+      this.updateAuthButton();
+      this.loadPublicUsers();
+      if (document.getElementById("view-profile")?.classList.contains("active")) {
+        this.renderProfile();
+      }
+    }
+  },
+
+  /* ================= NOTIFICACIONES (CAMPANITA 🔔) ================= */
+  async loadNotifications() {
+    if (!this.currentUser || !this.userToken) {
+      this.notifications = [];
+      this.unreadCount = 0;
+      this.updateNotifUI();
+      return;
+    }
+
+    try {
+      const data = await this.api("notifications", { token: this.userToken });
+      this.notifications = data.notifications || [];
+      this.unreadCount = Number(data.unreadCount || 0);
+      this.updateNotifUI();
+      if (document.getElementById("modal-notifications")?.classList.contains("open")) {
+        this.renderNotificationsList();
+      }
+    } catch {}
+  },
+
+  updateNotifUI() {
+    const btn = document.getElementById("btn-notif");
+    const badge = document.getElementById("notif-badge");
+    if (!btn || !badge) return;
+
+    if (!this.currentUser) {
+      btn.classList.add("hidden");
+      return;
+    }
+
+    btn.classList.remove("hidden");
+    if (this.unreadCount > 0) {
+      badge.textContent = this.unreadCount > 99 ? "99+" : String(this.unreadCount);
+      badge.classList.remove("hidden");
+      btn.classList.add("has-unread");
+    } else {
+      badge.classList.add("hidden");
+      btn.classList.remove("has-unread");
+    }
+  },
+
+  async openNotificationsModal() {
+    if (!this.currentUser || !this.userToken) {
+      this.openAuthModal("login");
+      return;
+    }
+    this.openModal("modal-notifications");
+    this.renderNotificationsList();
+    await this.loadNotifications();
+  },
+
+  renderNotificationsList() {
+    const box = document.getElementById("notifications-list");
+    if (!box) return;
+
+    if (!this.notifications.length) {
+      box.innerHTML = `<p class="muted" style="text-align:center;padding:26px 10px;">No tienes notificaciones todavía.</p>`;
+      return;
+    }
+
+    const icons = {
+      news: "📰",
+      reply: "💬",
+      mention: "🏷️",
+      comment_reaction: "❤️",
+      name_change: "✏️"
+    };
+
+    box.innerHTML = this.notifications.map(n => `
+      <button type="button" class="notif-item ${n.is_read ? "" : "unread"}" onclick="App.handleNotificationClick('${n.id}')">
+        <div class="notif-icon">
+          ${n.actor_avatar
+            ? this.renderAvatar(n.actor_avatar, n.actor_name, "avatar-sm")
+            : `<span class="notif-emoji-badge">${icons[n.type] || "🔔"}</span>`}
+        </div>
+        <div class="notif-content">
+          <div class="notif-msg">${this.esc(n.message)}</div>
+          <div class="muted notif-time">${this.formatDate(n.created_at)}</div>
+        </div>
+        ${n.is_read ? "" : `<span class="notif-dot"></span>`}
+      </button>
+    `).join("");
+  },
+
+  async handleNotificationClick(notifId) {
+    const n = this.notifications.find(x => x.id === notifId);
+    if (!n) return;
+
+    if (!n.is_read) {
+      n.is_read = 1;
+      this.unreadCount = Math.max(0, this.unreadCount - 1);
+      this.updateNotifUI();
+      this.api("notifications/read", {
+        method: "POST",
+        token: this.userToken,
+        body: { id: notifId }
+      }).catch(() => {});
+    }
+
+    this.closeModal("modal-notifications");
+
+    if (n.type === "name_change") {
+      this.switchView("profile");
+      return;
+    }
+
+    if (n.news_id) {
+      this.switchView("news");
+      if (!this.newsList.some(x => x.id === n.news_id)) {
+        await this.loadNews(false);
+      }
+      if (n.comment_id) {
+        this.openNewsComments[n.news_id] = true;
+        this.renderNewsFeed();
+        await this.loadComments(n.news_id);
+      }
+
+      setTimeout(() => {
+        const targetEl = (n.comment_id && document.getElementById(`comment-item-${n.comment_id}`))
+          || document.getElementById(`news-card-${n.news_id}`);
+        if (targetEl) {
+          targetEl.scrollIntoView({ behavior: "smooth", block: "center" });
+          targetEl.classList.add("flash-highlight");
+          setTimeout(() => targetEl.classList.remove("flash-highlight"), 2200);
+        }
+      }, 120);
+    }
+  },
+
+  async markAllNotificationsRead() {
+    if (!this.userToken) return;
+    try {
+      await this.api("notifications/read", { method: "POST", token: this.userToken, body: {} });
+      this.notifications.forEach(n => { n.is_read = 1; });
+      this.unreadCount = 0;
+      this.updateNotifUI();
+      this.renderNotificationsList();
+      this.toast("Todas marcadas como leídas.");
+    } catch (err) {
+      this.toast(err.message);
+    }
+  },
+
+  async clearAllNotifications() {
+    if (!this.userToken || !this.notifications.length) return;
+    if (!confirm("¿Borrar todas tus notificaciones?")) return;
+    try {
+      await this.api("notifications", { method: "DELETE", token: this.userToken });
+      this.notifications = [];
+      this.unreadCount = 0;
+      this.updateNotifUI();
+      this.renderNotificationsList();
+      this.toast("Notificaciones eliminadas.");
+    } catch (err) {
+      this.toast(err.message);
+    }
   },
 
   /* ================= COMPRESIÓN DE IMÁGENES PARA R2 ================= */
@@ -281,7 +701,7 @@ const App = {
     }).join("");
   },
 
-  /* ================= NOTICIAS PÚBLICAS, REACCIONES Y COMENTARIOS ================= */
+  /* ================= NOTICIAS EN TIEMPO REAL, REACCIONES Y COMENTARIOS ================= */
   async loadNews(showToast = false) {
     const feed = document.getElementById("news-feed");
     if (feed && !this.newsList.length) {
@@ -291,12 +711,59 @@ const App = {
       const data = await this.api("news", { token: this.userToken });
       this.newsList = data.news || [];
       if (Array.isArray(data.emojis) && data.emojis.length) this.newsEmojis = data.emojis;
+      if (Array.isArray(data.commentEmojis) && data.commentEmojis.length) this.commentEmojis = data.commentEmojis;
       if (showToast) this.toast("Noticias actualizadas.");
       this.renderNewsFeed();
       if (this.adminTab === "news" && this.adminToken) this.renderAdmin();
     } catch (err) {
       if (feed) feed.innerHTML = `<div class="glass" style="padding:24px;text-align:center;">${this.esc(err.message)}</div>`;
     }
+  },
+
+  renderNewsReactionsHtml(n) {
+    return this.newsEmojis.map(emoji => {
+      const info = n.reactions?.[emoji] || { count: 0, reacted: false };
+      return `
+        <button type="button" class="reaction-btn ${info.reacted ? "active" : ""}" onclick="App.toggleReaction('${n.id}', '${emoji}')">
+          <span>${emoji}</span>
+          <span class="reaction-count">${info.count}</span>
+        </button>
+      `;
+    }).join("");
+  },
+
+  renderSingleNewsCard(n) {
+    const commentsOpen = Boolean(this.openNewsComments[n.id]);
+    return `
+      <article class="glass news-card" id="news-card-${n.id}">
+        <div class="news-card-header">
+          <div class="news-badges">
+            ${n.pinned ? `<span class="badge badge-pin">📌 FIJADO</span>` : ""}
+            <span class="badge">${this.esc(n.tag || "Anuncio")}</span>
+          </div>
+          <span class="muted news-date">${this.formatDate(n.created_at)}</span>
+        </div>
+
+        <h3 class="news-title">${this.esc(n.title)}</h3>
+
+        ${n.image_url ? `
+          <div class="news-image-wrap">
+            <img src="${this.esc(n.image_url)}" alt="${this.esc(n.title)}" onerror="App.imgFallback(this, 'NOTICIA')" />
+          </div>
+        ` : ""}
+
+        <div class="news-content">${this.esc(n.content).replace(/\n/g, "<br>")}</div>
+
+        <div class="news-actions-bar">
+          <div class="reactions-row" id="news-reactions-${n.id}">${this.renderNewsReactionsHtml(n)}</div>
+          <button type="button" class="btn btn-outline btn-sm" onclick="App.toggleComments('${n.id}')">
+            💬 Comentarios (<span id="news-comment-count-${n.id}">${n.comments_count || 0}</span>)
+          </button>
+        </div>
+
+        ${commentsOpen ? `<div class="comments-section" id="comments-box-${n.id}">${this.renderCommentsSectionHtml(n.id)}</div>` : ""}
+      </article>
+    `;
   },
 
   renderNewsFeed() {
@@ -312,49 +779,7 @@ const App = {
       return;
     }
 
-    feed.innerHTML = this.newsList.map(n => {
-      const commentsOpen = Boolean(this.openNewsComments[n.id]);
-      const reactionsHtml = this.newsEmojis.map(emoji => {
-        const info = n.reactions?.[emoji] || { count: 0, reacted: false };
-        return `
-          <button class="reaction-btn ${info.reacted ? "active" : ""}" onclick="App.toggleReaction('${n.id}', '${emoji}')">
-            <span>${emoji}</span>
-            <span class="reaction-count">${info.count}</span>
-          </button>
-        `;
-      }).join("");
-
-      return `
-        <article class="glass news-card" id="news-card-${n.id}">
-          <div class="news-card-header">
-            <div class="news-badges">
-              ${n.pinned ? `<span class="badge badge-pin">📌 FIJADO</span>` : ""}
-              <span class="badge">${this.esc(n.tag || "Anuncio")}</span>
-            </div>
-            <span class="muted news-date">${this.formatDate(n.created_at)}</span>
-          </div>
-
-          <h3 class="news-title">${this.esc(n.title)}</h3>
-
-          ${n.image_url ? `
-            <div class="news-image-wrap">
-              <img src="${this.esc(n.image_url)}" alt="${this.esc(n.title)}" onerror="App.imgFallback(this, 'NOTICIA')" />
-            </div>
-          ` : ""}
-
-          <div class="news-content">${this.esc(n.content).replace(/\n/g, "<br>")}</div>
-
-          <div class="news-actions-bar">
-            <div class="reactions-row">${reactionsHtml}</div>
-            <button class="btn btn-outline btn-sm" onclick="App.toggleComments('${n.id}')">
-              💬 Comentarios (${n.comments_count || 0})
-            </button>
-          </div>
-
-          ${commentsOpen ? `<div class="comments-section" id="comments-box-${n.id}">${this.renderCommentsHtml(n.id)}</div>` : ""}
-        </article>
-      `;
-    }).join("");
+    feed.innerHTML = this.newsList.map(n => this.renderSingleNewsCard(n)).join("");
   },
 
   async toggleReaction(newsId, emoji) {
@@ -371,8 +796,11 @@ const App = {
         body: { emoji }
       });
       const item = this.newsList.find(n => n.id === newsId);
-      if (item) item.reactions = reactions;
-      this.renderNewsFeed();
+      if (item) {
+        item.reactions = reactions;
+        const box = document.getElementById(`news-reactions-${newsId}`);
+        if (box) box.innerHTML = this.renderNewsReactionsHtml(item);
+      }
     } catch (err) {
       this.toast(err.message);
     }
@@ -382,12 +810,20 @@ const App = {
     const isOpen = Boolean(this.openNewsComments[newsId]);
     if (isOpen) {
       delete this.openNewsComments[newsId];
-      this.renderNewsFeed();
+      const box = document.getElementById(`comments-box-${newsId}`);
+      if (box) box.remove();
       return;
     }
 
     this.openNewsComments[newsId] = true;
-    this.renderNewsFeed();
+    const card = document.getElementById(`news-card-${newsId}`);
+    if (card && !document.getElementById(`comments-box-${newsId}`)) {
+      const div = document.createElement("div");
+      div.className = "comments-section";
+      div.id = `comments-box-${newsId}`;
+      div.innerHTML = this.renderCommentsSectionHtml(newsId);
+      card.appendChild(div);
+    }
 
     if (!this.publicUsers.length) await this.loadPublicUsers();
     await this.loadComments(newsId);
@@ -395,11 +831,19 @@ const App = {
 
   async loadComments(newsId) {
     try {
-      const { comments } = await this.api(`news/${newsId}/comments`);
-      this.newsCommentsCache[newsId] = comments || [];
+      const data = await this.api(`news/${newsId}/comments`, { token: this.userToken });
+      this.newsCommentsCache[newsId] = data.comments || [];
+      if (Array.isArray(data.commentEmojis) && data.commentEmojis.length) {
+        this.commentEmojis = data.commentEmojis;
+      }
       const item = this.newsList.find(n => n.id === newsId);
-      if (item) item.comments_count = (comments || []).length;
-      this.renderNewsFeed();
+      if (item) item.comments_count = this.newsCommentsCache[newsId].length;
+
+      const countEl = document.getElementById(`news-comment-count-${newsId}`);
+      if (countEl && item) countEl.textContent = item.comments_count;
+
+      const listEl = document.getElementById(`comments-list-${newsId}`);
+      if (listEl) listEl.innerHTML = this.renderCommentsListOnly(newsId);
     } catch (err) {
       this.toast(err.message);
     }
@@ -429,13 +873,50 @@ const App = {
       .replace(/\n/g, "<br>");
   },
 
+  renderCommentReactionsHtml(c) {
+    return this.commentEmojis.map(emoji => {
+      const info = c.reactions?.[emoji] || { count: 0, reacted: false };
+      return `
+        <button type="button" class="comment-react-btn ${info.reacted ? "active" : ""} ${info.count > 0 ? "has-count" : ""}"
+          onclick="App.toggleCommentReaction('${c.news_id}', '${c.id}', '${emoji}')" title="Reaccionar con ${emoji}">
+          <span>${emoji}</span>${info.count > 0 ? `<span class="comment-react-count">${info.count}</span>` : ""}
+        </button>
+      `;
+    }).join("");
+  },
+
+  async toggleCommentReaction(newsId, commentId, emoji) {
+    if (!this.currentUser || !this.userToken) {
+      this.toast("Inicia sesión para reaccionar a los comentarios.");
+      this.openAuthModal("login");
+      return;
+    }
+
+    try {
+      const { reactions } = await this.api(`news/comments/${commentId}/react`, {
+        method: "POST",
+        token: this.userToken,
+        body: { emoji }
+      });
+      const list = this.newsCommentsCache[newsId] || [];
+      const comment = list.find(c => c.id === commentId);
+      if (comment) {
+        comment.reactions = reactions;
+        const box = document.getElementById(`comment-reactions-${commentId}`);
+        if (box) box.innerHTML = this.renderCommentReactionsHtml(comment);
+      }
+    } catch (err) {
+      this.toast(err.message);
+    }
+  },
+
   renderCommentItem(c, newsId, isReply = false) {
     const canDelete = Boolean(
       (this.currentUser && this.currentUser.id === c.user_id) || this.adminToken
     );
 
     return `
-      <div class="comment-item ${isReply ? "comment-reply" : ""}">
+      <div class="comment-item ${isReply ? "comment-reply" : ""}" id="comment-item-${c.id}">
         <button type="button" class="avatar-btn" onclick="App.openPublicProfile('${c.user_id}')">
           ${this.renderAvatar(c.user_avatar, c.user_name, isReply ? "avatar-xs" : "avatar-sm")}
         </button>
@@ -448,25 +929,33 @@ const App = {
             <span class="muted comment-time">${this.formatDate(c.created_at)}</span>
           </div>
           <div class="comment-text">${this.formatCommentContent(c.content)}</div>
-          <div class="comment-actions">
-            <button type="button" class="text-btn" onclick="App.startReply('${newsId}', '${c.id}', '${c.user_id}', '${this.esc(c.user_name).replace(/'/g, "\\'")}')">
-              Responder
-            </button>
-            ${canDelete ? `
-              <button type="button" class="text-btn text-danger" onclick="App.deleteComment('${newsId}', '${c.id}')">
-                Eliminar
+          <div class="comment-footer-row">
+            <div class="comment-reactions-row" id="comment-reactions-${c.id}">
+              ${this.renderCommentReactionsHtml(c)}
+            </div>
+            <div class="comment-actions">
+              <button type="button" class="text-btn" onclick="App.startReply('${newsId}', '${c.id}', '${c.user_id}', '${this.esc(c.user_name).replace(/'/g, "\\'")}')">
+                Responder
               </button>
-            ` : ""}
+              ${canDelete ? `
+                <button type="button" class="text-btn text-danger" onclick="App.deleteComment('${newsId}', '${c.id}')">
+                  Eliminar
+                </button>
+              ` : ""}
+            </div>
           </div>
         </div>
       </div>
     `;
   },
 
-  renderCommentsHtml(newsId) {
+  renderCommentsListOnly(newsId) {
     const comments = this.newsCommentsCache[newsId];
     if (!comments) {
       return `<p class="muted" style="padding:10px 0;font-size:0.86rem;">Cargando comentarios...</p>`;
+    }
+    if (!comments.length) {
+      return `<p class="muted" style="font-size:0.86rem;margin-bottom:4px;">Sé el primero en comentar esta noticia.</p>`;
     }
 
     const roots = comments.filter(c => !c.parent_id);
@@ -478,25 +967,30 @@ const App = {
       }
     }
 
-    const replyTarget = this.replyState[newsId];
-    const listHtml = roots.length
-      ? roots.map(root => `
-          <div class="comment-thread">
-            ${this.renderCommentItem(root, newsId, false)}
-            ${(repliesMap[root.id] || []).map(rep => this.renderCommentItem(rep, newsId, true)).join("")}
-          </div>
-        `).join("")
-      : `<p class="muted" style="font-size:0.86rem;margin-bottom:12px;">Sé el primero en comentar esta noticia.</p>`;
+    return roots.map(root => `
+      <div class="comment-thread">
+        ${this.renderCommentItem(root, newsId, false)}
+        ${(repliesMap[root.id] || []).map(rep => this.renderCommentItem(rep, newsId, true)).join("")}
+      </div>
+    `).join("");
+  },
 
+  renderReplyBannerHtml(newsId) {
+    const replyTarget = this.replyState[newsId];
+    if (!replyTarget) return "";
+    return `
+      <div class="reply-banner">
+        <span>Respondiendo a <strong>@${this.esc(replyTarget.replyToName)}</strong></span>
+        <button type="button" class="text-btn" onclick="App.cancelReply('${newsId}')">✕ Cancelar</button>
+      </div>
+    `;
+  },
+
+  renderCommentsSectionHtml(newsId) {
     const composerHtml = this.currentUser
       ? `
         <div class="comment-composer">
-          ${replyTarget ? `
-            <div class="reply-banner">
-              <span>Respondiendo a <strong>@${this.esc(replyTarget.replyToName)}</strong></span>
-              <button type="button" class="text-btn" onclick="App.cancelReply('${newsId}')">✕ Cancelar</button>
-            </div>
-          ` : ""}
+          <div id="reply-banner-slot-${newsId}">${this.renderReplyBannerHtml(newsId)}</div>
           <div class="mention-wrap">
             <textarea id="comment-input-${newsId}" rows="2" class="input"
               placeholder="Escribe un comentario... Usa @ para etiquetar jugadores"
@@ -516,7 +1010,7 @@ const App = {
       `;
 
     return `
-      <div class="comments-list">${listHtml}</div>
+      <div class="comments-list" id="comments-list-${newsId}">${this.renderCommentsListOnly(newsId)}</div>
       ${composerHtml}
     `;
   },
@@ -528,21 +1022,22 @@ const App = {
       return;
     }
     this.replyState[newsId] = { parentId: commentId, replyToUserId: userId, replyToName: userName };
-    this.renderNewsFeed();
-    setTimeout(() => {
-      const input = document.getElementById(`comment-input-${newsId}`);
-      if (input) {
-        if (!input.value.includes(`@${userName}`)) {
-          input.value = `@${userName} ${input.value}`;
-        }
-        input.focus();
+    const slot = document.getElementById(`reply-banner-slot-${newsId}`);
+    if (slot) slot.innerHTML = this.renderReplyBannerHtml(newsId);
+
+    const input = document.getElementById(`comment-input-${newsId}`);
+    if (input) {
+      if (!input.value.includes(`@${userName}`)) {
+        input.value = `@${userName} ${input.value}`;
       }
-    }, 30);
+      input.focus();
+    }
   },
 
   cancelReply(newsId) {
     delete this.replyState[newsId];
-    this.renderNewsFeed();
+    const slot = document.getElementById(`reply-banner-slot-${newsId}`);
+    if (slot) slot.innerHTML = "";
   },
 
   handleMentionInput(newsId, textarea) {
@@ -621,12 +1116,20 @@ const App = {
       });
 
       if (!this.newsCommentsCache[newsId]) this.newsCommentsCache[newsId] = [];
-      this.newsCommentsCache[newsId].push(comment);
+      if (!this.newsCommentsCache[newsId].some(c => c.id === comment.id)) {
+        this.newsCommentsCache[newsId].push(comment);
+      }
       const item = this.newsList.find(n => n.id === newsId);
-      if (item) item.comments_count = (item.comments_count || 0) + 1;
-      delete this.replyState[newsId];
-      this.renderNewsFeed();
-      this.toast("Comentario publicado.");
+      if (item) item.comments_count = this.newsCommentsCache[newsId].length;
+
+      const countEl = document.getElementById(`news-comment-count-${newsId}`);
+      if (countEl && item) countEl.textContent = item.comments_count;
+
+      if (input) input.value = "";
+      this.cancelReply(newsId);
+
+      const listEl = document.getElementById(`comments-list-${newsId}`);
+      if (listEl) listEl.innerHTML = this.renderCommentsListOnly(newsId);
     } catch (err) {
       this.toast(err.message);
     }
@@ -635,12 +1138,24 @@ const App = {
   async deleteComment(newsId, commentId) {
     if (!confirm("¿Eliminar este comentario?")) return;
     try {
-      const useAdmin = Boolean(this.adminToken && (!this.currentUser || this.newsCommentsCache[newsId]?.find(c => c.id === commentId)?.user_id !== this.currentUser.id));
+      const target = this.newsCommentsCache[newsId]?.find(c => c.id === commentId);
+      const useAdmin = Boolean(this.adminToken && (!this.currentUser || target?.user_id !== this.currentUser.id));
       const endpoint = useAdmin ? `admin/comments/${commentId}` : `news/comments/${commentId}`;
       const token = useAdmin ? this.adminToken : this.userToken;
 
       await this.api(endpoint, { method: "DELETE", token });
-      await this.loadComments(newsId);
+      if (this.newsCommentsCache[newsId]) {
+        this.newsCommentsCache[newsId] = this.newsCommentsCache[newsId].filter(
+          c => c.id !== commentId && c.parent_id !== commentId
+        );
+      }
+      const item = this.newsList.find(n => n.id === newsId);
+      if (item && this.newsCommentsCache[newsId]) item.comments_count = this.newsCommentsCache[newsId].length;
+      const countEl = document.getElementById(`news-comment-count-${newsId}`);
+      if (countEl && item) countEl.textContent = item.comments_count;
+      const listEl = document.getElementById(`comments-list-${newsId}`);
+      if (listEl) listEl.innerHTML = this.renderCommentsListOnly(newsId);
+
       this.toast("Comentario eliminado.");
     } catch (err) {
       this.toast(err.message);
@@ -654,10 +1169,17 @@ const App = {
 
     try {
       const { user } = await this.api(`users/${userId}`);
+      const metaChips = [
+        user.gender ? `<span class="profile-chip">⚧ ${this.esc(user.gender)}</span>` : "",
+        user.age ? `<span class="profile-chip">🎂 ${this.esc(user.age)} años</span>` : "",
+        user.birthday ? `<span class="profile-chip">📅 ${this.esc(this.formatBirthday(user.birthday))}</span>` : ""
+      ].filter(Boolean).join("");
+
       box.innerHTML = `
         <div class="public-profile-card">
           ${this.renderAvatar(user.avatar_url, user.name, "avatar-lg")}
           <h3 style="margin-top:12px;">${this.esc(user.name)}</h3>
+          ${metaChips ? `<div class="profile-chips">${metaChips}</div>` : ""}
           <p class="public-bio">${user.bio ? this.esc(user.bio) : "<span class='muted'>Sin descripción todavía.</span>"}</p>
           <span class="muted" style="font-size:0.78rem;">Miembro desde ${this.formatDate(user.created_at)}</span>
         </div>
@@ -667,7 +1189,178 @@ const App = {
     }
   },
 
-  /* ================= MI PERFIL Y CAMBIO DE NOMBRE ($5 USD) ================= */
+  /* ================= RECORTADOR DE FOTO DE PERFIL (ZOOM + ARRASTRE) ================= */
+  bindCropperEvents() {
+    if (this.cropper.bound) return;
+    const canvas = document.getElementById("crop-canvas");
+    if (!canvas) return;
+    this.cropper.bound = true;
+
+    canvas.addEventListener("pointerdown", (e) => {
+      if (!this.cropper.img) return;
+      this.cropper.dragging = true;
+      this.cropper.startX = e.clientX - this.cropper.offsetX;
+      this.cropper.startY = e.clientY - this.cropper.offsetY;
+      canvas.setPointerCapture?.(e.pointerId);
+    });
+
+    canvas.addEventListener("pointermove", (e) => {
+      if (!this.cropper.dragging || !this.cropper.img) return;
+      e.preventDefault();
+      this.cropper.offsetX = e.clientX - this.cropper.startX;
+      this.cropper.offsetY = e.clientY - this.cropper.startY;
+      this.clampCropOffsets();
+      this.drawAvatarCrop();
+    });
+
+    const stopDrag = () => { this.cropper.dragging = false; };
+    canvas.addEventListener("pointerup", stopDrag);
+    canvas.addEventListener("pointercancel", stopDrag);
+    canvas.addEventListener("pointerleave", stopDrag);
+  },
+
+  openAvatarCropper(inputEl) {
+    const file = inputEl.files?.[0];
+    inputEl.value = "";
+    if (!file) return;
+    if (!file.type.startsWith("image/")) return this.toast("Selecciona una imagen válida.");
+
+    const reader = new FileReader();
+    reader.onerror = () => this.toast("No se pudo leer la imagen.");
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onerror = () => this.toast("Imagen no válida.");
+      img.onload = () => {
+        const size = 280;
+        const baseScale = Math.max(size / img.width, size / img.height);
+        this.cropper.img = img;
+        this.cropper.baseScale = baseScale;
+        this.cropper.zoom = 1;
+        this.cropper.offsetX = 0;
+        this.cropper.offsetY = 0;
+        this.cropper.saving = false;
+
+        const slider = document.getElementById("crop-zoom");
+        const val = document.getElementById("crop-zoom-val");
+        const saveBtn = document.getElementById("btn-crop-save");
+        if (slider) slider.value = "1";
+        if (val) val.textContent = "1.0x";
+        if (saveBtn) {
+          saveBtn.disabled = false;
+          saveBtn.textContent = "Guardar Foto ✓";
+        }
+
+        this.openModal("modal-avatar-crop");
+        this.drawAvatarCrop();
+      };
+      img.src = e.target.result;
+    };
+    reader.readAsDataURL(file);
+  },
+
+  closeAvatarCropper() {
+    this.cropper.img = null;
+    this.cropper.dragging = false;
+    this.closeModal("modal-avatar-crop");
+  },
+
+  onCropZoom(val) {
+    this.cropper.zoom = parseFloat(val) || 1;
+    const label = document.getElementById("crop-zoom-val");
+    if (label) label.textContent = `${this.cropper.zoom.toFixed(1)}x`;
+    this.clampCropOffsets();
+    this.drawAvatarCrop();
+  },
+
+  clampCropOffsets() {
+    const c = this.cropper;
+    if (!c.img) return;
+    const size = 280;
+    const drawW = c.img.width * c.baseScale * c.zoom;
+    const drawH = c.img.height * c.baseScale * c.zoom;
+    const maxX = Math.max(0, (drawW - size) / 2);
+    const maxY = Math.max(0, (drawH - size) / 2);
+    c.offsetX = Math.min(maxX, Math.max(-maxX, c.offsetX));
+    c.offsetY = Math.min(maxY, Math.max(-maxY, c.offsetY));
+  },
+
+  drawAvatarCrop() {
+    const canvas = document.getElementById("crop-canvas");
+    const c = this.cropper;
+    if (!canvas || !c.img) return;
+
+    const ctx = canvas.getContext("2d");
+    const size = canvas.width;
+    const drawW = c.img.width * c.baseScale * c.zoom;
+    const drawH = c.img.height * c.baseScale * c.zoom;
+    const dx = (size - drawW) / 2 + c.offsetX;
+    const dy = (size - drawH) / 2 + c.offsetY;
+
+    ctx.clearRect(0, 0, size, size);
+    ctx.fillStyle = "#060912";
+    ctx.fillRect(0, 0, size, size);
+    ctx.drawImage(c.img, dx, dy, drawW, drawH);
+  },
+
+  async confirmAvatarCrop() {
+    const c = this.cropper;
+    if (!c.img || c.saving) return;
+
+    c.saving = true;
+    const saveBtn = document.getElementById("btn-crop-save");
+    if (saveBtn) {
+      saveBtn.disabled = true;
+      saveBtn.textContent = "Subiendo...";
+    }
+
+    try {
+      const outSize = 420;
+      const ratio = outSize / 280;
+      const outCanvas = document.createElement("canvas");
+      outCanvas.width = outSize;
+      outCanvas.height = outSize;
+      const ctx = outCanvas.getContext("2d");
+
+      const drawW = c.img.width * c.baseScale * c.zoom * ratio;
+      const drawH = c.img.height * c.baseScale * c.zoom * ratio;
+      const dx = (outSize - drawW) / 2 + c.offsetX * ratio;
+      const dy = (outSize - drawH) / 2 + c.offsetY * ratio;
+
+      ctx.drawImage(c.img, dx, dy, drawW, drawH);
+
+      const blob = await new Promise((resolve, reject) => {
+        outCanvas.toBlob(
+          (b) => (b ? resolve(b) : reject(new Error("No se pudo generar la foto."))),
+          "image/webp",
+          0.88
+        );
+      });
+
+      const url = await this.uploadImageToR2(blob, "avatars", this.userToken);
+      const { user } = await this.api("profile", {
+        method: "PATCH",
+        token: this.userToken,
+        body: { avatar_url: url }
+      });
+
+      this.currentUser = user;
+      this.updateAuthButton();
+      this.loadPublicUsers();
+      this.closeAvatarCropper();
+      this.paintProfile();
+      this.toast("Foto de perfil actualizada.");
+    } catch (err) {
+      this.toast(err.message);
+      if (saveBtn) {
+        saveBtn.disabled = false;
+        saveBtn.textContent = "Guardar Foto ✓";
+      }
+    } finally {
+      c.saving = false;
+    }
+  },
+
+  /* ================= MI PERFIL (BIO, GÉNERO, CUMPLEAÑOS, EDAD) Y CAMBIO DE NOMBRE ($5) ================= */
   async renderProfile() {
     const box = document.getElementById("profile-container");
     if (!box) return;
@@ -675,7 +1368,7 @@ const App = {
     if (!this.currentUser || !this.userToken) {
       box.innerHTML = `
         <div class="glass" style="padding:28px;text-align:center;">
-          <p class="muted" style="margin-bottom:14px;">Inicia sesión para personalizar tu foto de perfil, tu descripción y tu nombre.</p>
+          <p class="muted" style="margin-bottom:14px;">Inicia sesión para personalizar tu foto de perfil, bio, género, cumpleaños y nombre.</p>
           <button class="btn btn-primary" onclick="App.openAuthModal('login')">Iniciar Sesión</button>
         </div>
       `;
@@ -695,12 +1388,19 @@ const App = {
     }
   },
 
+  onBirthdayInput(val) {
+    const autoAge = this.calculateAgeLocal(val);
+    const ageInput = document.getElementById("profile-age-input");
+    if (ageInput && autoAge !== "") ageInput.value = autoAge;
+  },
+
   paintProfile() {
     const box = document.getElementById("profile-container");
     const u = this.currentUser;
     if (!box || !u) return;
 
     const pendingReq = this.profileData.requests.find(r => r.status === "Pendiente");
+    const genders = ["", "Masculino", "Femenino", "No binario", "Prefiero no decir"];
 
     box.innerHTML = `
       <div class="glass profile-card">
@@ -708,8 +1408,8 @@ const App = {
           <div class="profile-avatar-col">
             ${this.renderAvatar(u.avatar_url, u.name, "avatar-xl")}
             <label class="btn btn-outline btn-sm" style="cursor:pointer;margin-top:10px;">
-              ${this.profileData.uploadingAvatar ? "Subiendo..." : "📷 Cambiar Foto (Gratis)"}
-              <input type="file" accept="image/*" style="display:none;" onchange="App.handleAvatarUpload(this)" ${this.profileData.uploadingAvatar ? "disabled" : ""} />
+              📷 Cambiar Foto + Zoom
+              <input type="file" accept="image/*" style="display:none;" onchange="App.openAvatarCropper(this)" />
             </label>
           </div>
 
@@ -723,11 +1423,30 @@ const App = {
             <p class="muted" style="font-size:0.86rem;margin-top:4px;">${this.esc(u.email)}</p>
             ${pendingReq ? `<p class="hint" style="color:var(--accent);margin-top:8px;">Tienes una solicitud pendiente para cambiar a <strong>${this.esc(pendingReq.new_name)}</strong>.</p>` : ""}
 
-            <label class="field-label" style="margin-top:16px;">Descripción / Bio (Gratis, máx. 240 caracteres)</label>
+            <div class="profile-meta-grid">
+              <div>
+                <label class="field-label">Género</label>
+                <select id="profile-gender-input" class="input">
+                  ${genders.map(g => `<option value="${this.esc(g)}" ${(u.gender || "") === g ? "selected" : ""}>${g || "Sin especificar"}</option>`).join("")}
+                </select>
+              </div>
+              <div>
+                <label class="field-label">Fecha de cumpleaños</label>
+                <input type="date" id="profile-birthday-input" class="input" value="${this.esc(u.birthday || "")}"
+                  onchange="App.onBirthdayInput(this.value)" />
+              </div>
+              <div>
+                <label class="field-label">Edad</label>
+                <input type="number" id="profile-age-input" class="input" min="10" max="120"
+                  value="${u.age ?? ""}" placeholder="Ej: 22" />
+              </div>
+            </div>
+
+            <label class="field-label" style="margin-top:14px;">Descripción / Bio (Gratis, máx. 240 caracteres)</label>
             <textarea id="profile-bio-input" rows="3" maxlength="240" class="input" placeholder="Cuéntale a la comunidad qué juegos juegas o tu clan...">${this.esc(u.bio || "")}</textarea>
-            <div style="display:flex;justify-content:flex-end;margin-top:10px;">
-              <button class="btn btn-primary btn-sm" onclick="App.saveProfileBio()" ${this.profileData.savingBio ? "disabled" : ""}>
-                ${this.profileData.savingBio ? "Guardando..." : "Guardar Descripción"}
+            <div style="display:flex;justify-content:flex-end;margin-top:12px;">
+              <button class="btn btn-primary btn-sm" onclick="App.saveProfileDetails()" ${this.profileData.savingProfile ? "disabled" : ""}>
+                ${this.profileData.savingProfile ? "Guardando..." : "Guardar Perfil"}
               </button>
             </div>
           </div>
@@ -756,53 +1475,29 @@ const App = {
     `;
   },
 
-  async handleAvatarUpload(inputEl) {
-    const file = inputEl.files?.[0];
-    if (!file) return;
-    if (!file.type.startsWith("image/")) return this.toast("Selecciona una imagen válida.");
-
-    this.profileData.uploadingAvatar = true;
-    this.paintProfile();
-
-    try {
-      const blob = await this.compressToBlob(file, 450, 0.85);
-      const url = await this.uploadImageToR2(blob, "avatars", this.userToken);
-      const { user } = await this.api("profile", {
-        method: "PATCH",
-        token: this.userToken,
-        body: { avatar_url: url }
-      });
-      this.currentUser = user;
-      this.updateAuthButton();
-      this.loadPublicUsers();
-      this.toast("Foto de perfil actualizada.");
-    } catch (err) {
-      this.toast(err.message);
-    } finally {
-      this.profileData.uploadingAvatar = false;
-      inputEl.value = "";
-      this.paintProfile();
-    }
-  },
-
-  async saveProfileBio() {
+  async saveProfileDetails() {
     const bio = (document.getElementById("profile-bio-input")?.value || "").trim();
-    this.profileData.savingBio = true;
+    const gender = document.getElementById("profile-gender-input")?.value || "";
+    const birthday = document.getElementById("profile-birthday-input")?.value || "";
+    const rawAge = (document.getElementById("profile-age-input")?.value || "").trim();
+    const age = rawAge === "" ? null : parseInt(rawAge, 10);
+
+    this.profileData.savingProfile = true;
     this.paintProfile();
 
     try {
       const { user } = await this.api("profile", {
         method: "PATCH",
         token: this.userToken,
-        body: { bio }
+        body: { bio, gender, birthday, age }
       });
       this.currentUser = user;
       this.loadPublicUsers();
-      this.toast("Descripción guardada.");
+      this.toast("Perfil actualizado.");
     } catch (err) {
       this.toast(err.message);
     } finally {
-      this.profileData.savingBio = false;
+      this.profileData.savingProfile = false;
       this.paintProfile();
     }
   },
@@ -1447,13 +2142,20 @@ const App = {
     this.currentUser = user;
     localStorage.setItem(USER_TOKEN_KEY, token);
     this.updateAuthButton();
+    this.updateNotifUI();
+    this.loadNotifications();
+    this.connectWebSocket();
   },
 
   logout() {
     this.userToken = null;
     this.currentUser = null;
+    this.notifications = [];
+    this.unreadCount = 0;
     localStorage.removeItem(USER_TOKEN_KEY);
     this.updateAuthButton();
+    this.updateNotifUI();
+    this.connectWebSocket();
     this.closeModal("modal-auth");
     this.toast("Sesión cerrada.");
     if (document.getElementById("view-history").classList.contains("active")) this.renderHistory();
@@ -1697,7 +2399,7 @@ const App = {
             pinned: ed.pinned
           }
         });
-        this.toast("Noticia publicada.");
+        this.toast("Noticia publicada y notificada a los usuarios.");
       }
 
       this.resetNewsEditor();
