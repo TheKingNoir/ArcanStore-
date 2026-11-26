@@ -2,8 +2,19 @@ const USER_TOKEN_KEY = "arcan_user_token";
 const ADMIN_TOKEN_KEY = "arcan_admin_token";
 const NAME_CHANGE_PRICE_USD = 5.0;
 
+const DEFAULT_LEVELS = [
+  { index: 0, name: "Bronce", slug: "bronze", icon: "🥉", min: 0 },
+  { index: 1, name: "Hierro", slug: "iron", icon: "🛡️", min: 50 },
+  { index: 2, name: "Plata", slug: "silver", icon: "⚔️", min: 100 },
+  { index: 3, name: "Oro", slug: "gold", icon: "👑", min: 150 },
+  { index: 4, name: "Esmeralda", slug: "emerald", icon: "❇️", min: 200 },
+  { index: 5, name: "Diamante", slug: "diamond", icon: "💎", min: 250 },
+  { index: 6, name: "Rubí", slug: "ruby", icon: "❤️‍🔥", min: 300 }
+];
+
 const App = {
   state: null,
+  levels: DEFAULT_LEVELS,
   currentUser: null,
   userToken: localStorage.getItem(USER_TOKEN_KEY) || null,
   adminToken: sessionStorage.getItem(ADMIN_TOKEN_KEY) || null,
@@ -11,6 +22,7 @@ const App = {
   selectedAdminGameId: null,
   adminOrders: [],
   adminNameChanges: [],
+  adminPromos: [],
   pendingGameId: null,
 
   /* WebSocket en tiempo real */
@@ -23,6 +35,18 @@ const App = {
   /* Notificaciones */
   notifications: [],
   unreadCount: 0,
+
+  /* Chat de soporte IA */
+  supportChat: {
+    open: false,
+    sending: false,
+    messages: [
+      {
+        role: "assistant",
+        content: "¡Hola! Soy el asistente de soporte de ArcanStore 🤖. Pregúntame sobre precios, tasa del día, métodos de pago, niveles o cómo hacer tu recarga."
+      }
+    ]
+  },
 
   /* Noticias, comentarios y perfiles públicos */
   newsList: [],
@@ -41,6 +65,16 @@ const App = {
     content: "",
     image_url: "",
     pinned: false,
+    saving: false
+  },
+
+  /* Formulario de nuevo código de descuento / referido en Admin */
+  promoForm: {
+    code: "",
+    owner_name: "",
+    discount_type: "percent",
+    discount_value: 0,
+    max_uses: "",
     saving: false
   },
 
@@ -85,6 +119,9 @@ const App = {
     confirmedId: false,
     packageId: null,
     paymentId: null,
+    promoInput: "",
+    appliedPromo: null,
+    checkingPromo: false,
     reference: "",
     receiptBlob: null,
     receiptPreviewUrl: "",
@@ -94,6 +131,7 @@ const App = {
 
   async init() {
     this.bindCropperEvents();
+    this.renderSupportMessages();
     await Promise.all([this.loadStore(), this.restoreUserSession(), this.loadPublicUsers()]);
     this.applyAppearance();
     this.updateAuthButton();
@@ -110,6 +148,25 @@ const App = {
         this.connectWebSocket();
       }
     });
+
+    // Abrir noticia compartida si el enlace trae ?news=ID
+    const sharedNewsId = new URLSearchParams(window.location.search).get("news");
+    if (sharedNewsId) {
+      this.openSharedNews(sharedNewsId);
+    }
+  },
+
+  async openSharedNews(newsId) {
+    this.switchView("news");
+    await this.loadNews(false);
+    setTimeout(() => {
+      const el = document.getElementById(`news-card-${newsId}`);
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "center" });
+        el.classList.add("flash-highlight");
+        setTimeout(() => el.classList.remove("flash-highlight"), 2500);
+      }
+    }, 180);
   },
 
   async api(endpoint, { method = "GET", body = null, token = null, isForm = false } = {}) {
@@ -130,7 +187,11 @@ const App = {
 
   async loadStore() {
     try {
-      this.state = await this.api("bootstrap");
+      const data = await this.api("bootstrap");
+      this.state = data;
+      if (Array.isArray(data.levels) && data.levels.length) {
+        this.levels = data.levels;
+      }
       if (!this.selectedAdminGameId && this.state.games.length) {
         this.selectedAdminGameId = this.state.games[0].id;
       }
@@ -178,12 +239,29 @@ const App = {
     img.src = `data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='400' height='250'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0%' stop-color='%230f172a'/><stop offset='100%' stop-color='%231e1b4b'/></linearGradient></defs><rect width='100%' height='100%' fill='url(%23g)'/><text x='50%' y='50%' fill='%2300e5ff' font-family='sans-serif' font-size='24' font-weight='bold' text-anchor='middle' dominant-baseline='middle'>${text}</text></svg>`;
   },
 
-  renderAvatar(url, name, sizeClass = "avatar-md") {
+  /* ================= NIVELES, INSIGNIAS Y MARCOS DE AVATAR ================= */
+  getLevelInfo(levelIndex = 0) {
+    const idx = Math.max(0, Math.min(this.levels.length - 1, Number(levelIndex || 0)));
+    return this.levels[idx] || DEFAULT_LEVELS[0];
+  },
+
+  renderLevelBadge(levelIndex = 0, compact = false) {
+    const lvl = this.getLevelInfo(levelIndex);
+    return `<span class="level-badge level-${lvl.slug} ${compact ? "level-badge-sm" : ""}">${lvl.icon} ${this.esc(lvl.name)}</span>`;
+  },
+
+  renderAvatar(url, name, sizeClass = "avatar-md", levelIndex = null) {
     const initial = this.esc((name || "?").trim().charAt(0).toUpperCase() || "?");
-    if (url) {
-      return `<img class="avatar ${sizeClass}" src="${this.esc(url)}" alt="${this.esc(name)}" onerror="this.outerHTML='<div class=\\'avatar avatar-fallback ${sizeClass}\\'>${initial}</div>'" />`;
+    const inner = url
+      ? `<img class="avatar ${sizeClass}" src="${this.esc(url)}" alt="${this.esc(name)}" onerror="this.outerHTML='<div class=\\'avatar avatar-fallback ${sizeClass}\\'>${initial}</div>'" />`
+      : `<div class="avatar avatar-fallback ${sizeClass}">${initial}</div>`;
+
+    if (levelIndex === null || levelIndex === undefined) {
+      return inner;
     }
-    return `<div class="avatar avatar-fallback ${sizeClass}">${initial}</div>`;
+
+    const lvl = this.getLevelInfo(levelIndex);
+    return `<span class="avatar-frame frame-${lvl.slug} frame-${sizeClass}" title="Nivel ${this.esc(lvl.name)}">${inner}</span>`;
   },
 
   toast(msg) {
@@ -221,6 +299,89 @@ const App = {
     const md = (now.getMonth() + 1) - m;
     if (md < 0 || (md === 0 && now.getDate() < d)) age--;
     return age >= 10 && age <= 120 ? age : "";
+  },
+
+  /* ================= CHAT FLOTANTE CON IA DE SOPORTE ================= */
+  toggleSupportChat() {
+    this.supportChat.open = !this.supportChat.open;
+    const widget = document.getElementById("support-chat-widget");
+    const fab = document.getElementById("support-fab");
+    if (widget) widget.classList.toggle("open", this.supportChat.open);
+    if (fab) fab.classList.toggle("active", this.supportChat.open);
+
+    if (this.supportChat.open) {
+      this.renderSupportMessages();
+      setTimeout(() => document.getElementById("support-chat-input")?.focus(), 120);
+    }
+  },
+
+  formatSupportMessage(text) {
+    return this.esc(text)
+      .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+      .replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" target="_blank" rel="noopener" class="support-link">$1</a>')
+      .replace(/\n/g, "<br>");
+  },
+
+  renderSupportMessages() {
+    const box = document.getElementById("support-chat-messages");
+    if (!box) return;
+
+    const bubbles = this.supportChat.messages.map(m => `
+      <div class="support-msg ${m.role === "user" ? "support-msg-user" : "support-msg-bot"}">
+        <div class="support-bubble">${this.formatSupportMessage(m.content)}</div>
+      </div>
+    `).join("");
+
+    const typingHtml = this.supportChat.sending
+      ? `<div class="support-msg support-msg-bot"><div class="support-bubble support-typing">Escribiendo...</div></div>`
+      : "";
+
+    box.innerHTML = bubbles + typingHtml;
+    box.scrollTop = box.scrollHeight;
+  },
+
+  sendQuickSupport(text) {
+    if (this.supportChat.sending) return;
+    const input = document.getElementById("support-chat-input");
+    if (input) input.value = text;
+    this.sendSupportMessage();
+  },
+
+  async sendSupportMessage(e = null) {
+    if (e) e.preventDefault();
+    if (this.supportChat.sending) return;
+
+    const input = document.getElementById("support-chat-input");
+    const sendBtn = document.getElementById("support-chat-send");
+    const message = (input?.value || "").trim();
+    if (!message) return;
+
+    const historyToSend = this.supportChat.messages.slice(-8);
+    this.supportChat.messages.push({ role: "user", content: message });
+    if (input) input.value = "";
+    this.supportChat.sending = true;
+    if (sendBtn) sendBtn.disabled = true;
+    this.renderSupportMessages();
+
+    try {
+      const { reply } = await this.api("support/chat", {
+        method: "POST",
+        body: { message, history: historyToSend }
+      });
+      this.supportChat.messages.push({
+        role: "assistant",
+        content: reply || "No recibí respuesta en este momento. Intenta de nuevo."
+      });
+    } catch (err) {
+      this.supportChat.messages.push({
+        role: "assistant",
+        content: `Hubo un error conectando con soporte (${err.message}). Puedes escribirnos directo por WhatsApp.`
+      });
+    } finally {
+      this.supportChat.sending = false;
+      if (sendBtn) sendBtn.disabled = false;
+      this.renderSupportMessages();
+    }
   },
 
   /* ================= WEBSOCKET EN TIEMPO REAL ================= */
@@ -323,7 +484,6 @@ const App = {
       const countEl = document.getElementById(`news-comment-count-${newsId}`);
       if (countEl && item) countEl.textContent = item.comments_count;
 
-      // Actualiza SOLO la lista de comentarios sin tocar el textarea donde escribe el usuario
       if (this.openNewsComments[newsId]) {
         const listEl = document.getElementById(`comments-list-${newsId}`);
         if (listEl) listEl.innerHTML = this.renderCommentsListOnly(newsId);
@@ -427,6 +587,17 @@ const App = {
       if (document.getElementById("view-profile")?.classList.contains("active")) {
         this.renderProfile();
       }
+      return;
+    }
+
+    if (ev.type === "level_updated" && this.currentUser && ev.userId === this.currentUser.id && ev.level) {
+      this.currentUser.level_index = ev.level.index;
+      this.currentUser.level = ev.level;
+      this.updateAuthButton();
+      this.loadPublicUsers();
+      if (document.getElementById("view-profile")?.classList.contains("active")) {
+        this.paintProfile();
+      }
     }
   },
 
@@ -495,7 +666,9 @@ const App = {
       reply: "💬",
       mention: "🏷️",
       comment_reaction: "❤️",
-      name_change: "✏️"
+      name_change: "✏️",
+      level: "🏆",
+      order: "✅"
     };
 
     box.innerHTML = this.notifications.map(n => `
@@ -531,8 +704,13 @@ const App = {
 
     this.closeModal("modal-notifications");
 
-    if (n.type === "name_change") {
+    if (n.type === "name_change" || n.type === "level") {
       this.switchView("profile");
+      return;
+    }
+
+    if (n.type === "order") {
+      this.switchView("history");
       return;
     }
 
@@ -701,7 +879,7 @@ const App = {
     }).join("");
   },
 
-  /* ================= NOTICIAS EN TIEMPO REAL, REACCIONES Y COMENTARIOS ================= */
+  /* ================= NOTICIAS EN TIEMPO REAL, COMPARTIR, REACCIONES Y COMENTARIOS ================= */
   async loadNews(showToast = false) {
     const feed = document.getElementById("news-feed");
     if (feed && !this.newsList.length) {
@@ -756,9 +934,14 @@ const App = {
 
         <div class="news-actions-bar">
           <div class="reactions-row" id="news-reactions-${n.id}">${this.renderNewsReactionsHtml(n)}</div>
-          <button type="button" class="btn btn-outline btn-sm" onclick="App.toggleComments('${n.id}')">
-            💬 Comentarios (<span id="news-comment-count-${n.id}">${n.comments_count || 0}</span>)
-          </button>
+          <div class="news-right-actions">
+            <button type="button" class="btn btn-outline btn-sm" onclick="App.shareNews('${n.id}')">
+              📤 Compartir
+            </button>
+            <button type="button" class="btn btn-outline btn-sm" onclick="App.toggleComments('${n.id}')">
+              💬 Comentarios (<span id="news-comment-count-${n.id}">${n.comments_count || 0}</span>)
+            </button>
+          </div>
         </div>
 
         ${commentsOpen ? `<div class="comments-section" id="comments-box-${n.id}">${this.renderCommentsSectionHtml(n.id)}</div>` : ""}
@@ -780,6 +963,77 @@ const App = {
     }
 
     feed.innerHTML = this.newsList.map(n => this.renderSingleNewsCard(n)).join("");
+  },
+
+  getNewsShareData(newsId) {
+    const item = this.newsList.find(n => n.id === newsId);
+    if (!item) return null;
+    const url = `${window.location.origin}/?news=${encodeURIComponent(newsId)}`;
+    const snippet = item.content.slice(0, 120) + (item.content.length > 120 ? "..." : "");
+    const text = `📰 ${item.title} — ${snippet}`;
+    return { item, url, text };
+  },
+
+  async shareNews(newsId) {
+    const data = this.getNewsShareData(newsId);
+    if (!data) return;
+
+    // En teléfonos con soporte nativo abre el selector del sistema (WhatsApp, IG, X, Telegram, etc.)
+    if (navigator.share) {
+      try {
+        await navigator.share({
+          title: `${data.item.title} | ArcanStore`,
+          text: data.text,
+          url: data.url
+        });
+        return;
+      } catch (err) {
+        if (err && err.name === "AbortError") return;
+      }
+    }
+
+    this.openShareNewsModal(newsId);
+  },
+
+  openShareNewsModal(newsId) {
+    const data = this.getNewsShareData(newsId);
+    const box = document.getElementById("share-news-content");
+    if (!data || !box) return;
+
+    const encUrl = encodeURIComponent(data.url);
+    const encText = encodeURIComponent(`${data.text}\n${data.url}`);
+    const encTitle = encodeURIComponent(data.text);
+
+    box.innerHTML = `
+      <h3 style="padding-right:34px;">Compartir Noticia</h3>
+      <p class="muted" style="font-size:0.86rem;margin:6px 0 14px;">${this.esc(data.item.title)}</p>
+
+      <div class="share-grid">
+        <a class="share-btn share-wa" href="https://wa.me/?text=${encText}" target="_blank" rel="noopener">💬 WhatsApp</a>
+        <a class="share-btn share-tg" href="https://t.me/share/url?url=${encUrl}&text=${encTitle}" target="_blank" rel="noopener">✈️ Telegram</a>
+        <a class="share-btn share-fb" href="https://www.facebook.com/sharer/sharer.php?u=${encUrl}" target="_blank" rel="noopener">📘 Facebook</a>
+        <a class="share-btn share-x" href="https://twitter.com/intent/tweet?text=${encTitle}&url=${encUrl}" target="_blank" rel="noopener">𝕏 Publicar en X</a>
+      </div>
+
+      <label class="field-label">Enlace directo de la noticia</label>
+      <div class="share-copy-row">
+        <input type="text" class="input" id="share-news-url" value="${this.esc(data.url)}" readonly />
+        <button type="button" class="btn btn-primary btn-sm" onclick="App.copySharedNewsUrl()">Copiar</button>
+      </div>
+    `;
+    this.openModal("modal-share-news");
+  },
+
+  copySharedNewsUrl() {
+    const input = document.getElementById("share-news-url");
+    if (!input) return;
+    navigator.clipboard?.writeText(input.value)
+      .then(() => this.toast("Enlace copiado al portapapeles."))
+      .catch(() => {
+        input.select();
+        document.execCommand?.("copy");
+        this.toast("Enlace copiado.");
+      });
   },
 
   async toggleReaction(newsId, emoji) {
@@ -914,17 +1168,19 @@ const App = {
     const canDelete = Boolean(
       (this.currentUser && this.currentUser.id === c.user_id) || this.adminToken
     );
+    const lvlIdx = Number(c.user_level_index || 0);
 
     return `
       <div class="comment-item ${isReply ? "comment-reply" : ""}" id="comment-item-${c.id}">
         <button type="button" class="avatar-btn" onclick="App.openPublicProfile('${c.user_id}')">
-          ${this.renderAvatar(c.user_avatar, c.user_name, isReply ? "avatar-xs" : "avatar-sm")}
+          ${this.renderAvatar(c.user_avatar, c.user_name, isReply ? "avatar-xs" : "avatar-sm", lvlIdx)}
         </button>
         <div class="comment-body">
           <div class="comment-meta">
             <button type="button" class="comment-author" onclick="App.openPublicProfile('${c.user_id}')">
               ${this.esc(c.user_name)}
             </button>
+            ${this.renderLevelBadge(lvlIdx, true)}
             ${c.reply_to_name ? `<span class="reply-badge">↳ @${this.esc(c.reply_to_name)}</span>` : ""}
             <span class="muted comment-time">${this.formatDate(c.created_at)}</span>
           </div>
@@ -1067,8 +1323,9 @@ const App = {
 
     box.innerHTML = matches.map(u => `
       <button type="button" class="mention-option" onmousedown="event.preventDefault(); App.insertMention('${newsId}', '${this.esc(u.name).replace(/'/g, "\\'")}')">
-        ${this.renderAvatar(u.avatar_url, u.name, "avatar-xs")}
+        ${this.renderAvatar(u.avatar_url, u.name, "avatar-xs", Number(u.level_index || 0))}
         <span>${this.esc(u.name)}</span>
+        ${this.renderLevelBadge(Number(u.level_index || 0), true)}
       </button>
     `).join("");
     box.classList.add("open");
@@ -1169,7 +1426,9 @@ const App = {
 
     try {
       const { user } = await this.api(`users/${userId}`);
+      const lvlIdx = Number(user.level?.index ?? user.level_index ?? 0);
       const metaChips = [
+        user.level ? `<span class="profile-chip">⚡ ${user.level.recharges} recargas</span>` : "",
         user.gender ? `<span class="profile-chip">⚧ ${this.esc(user.gender)}</span>` : "",
         user.age ? `<span class="profile-chip">🎂 ${this.esc(user.age)} años</span>` : "",
         user.birthday ? `<span class="profile-chip">📅 ${this.esc(this.formatBirthday(user.birthday))}</span>` : ""
@@ -1177,8 +1436,9 @@ const App = {
 
       box.innerHTML = `
         <div class="public-profile-card">
-          ${this.renderAvatar(user.avatar_url, user.name, "avatar-lg")}
+          ${this.renderAvatar(user.avatar_url, user.name, "avatar-lg", lvlIdx)}
           <h3 style="margin-top:12px;">${this.esc(user.name)}</h3>
+          <div style="margin-top:6px;">${this.renderLevelBadge(lvlIdx)}</div>
           ${metaChips ? `<div class="profile-chips">${metaChips}</div>` : ""}
           <p class="public-bio">${user.bio ? this.esc(user.bio) : "<span class='muted'>Sin descripción todavía.</span>"}</p>
           <span class="muted" style="font-size:0.78rem;">Miembro desde ${this.formatDate(user.created_at)}</span>
@@ -1360,7 +1620,7 @@ const App = {
     }
   },
 
-  /* ================= MI PERFIL (BIO, GÉNERO, CUMPLEAÑOS, EDAD) Y CAMBIO DE NOMBRE ($5) ================= */
+  /* ================= MI PERFIL, NIVELES Y CAMBIO DE NOMBRE ($5) ================= */
   async renderProfile() {
     const box = document.getElementById("profile-container");
     if (!box) return;
@@ -1368,7 +1628,7 @@ const App = {
     if (!this.currentUser || !this.userToken) {
       box.innerHTML = `
         <div class="glass" style="padding:28px;text-align:center;">
-          <p class="muted" style="margin-bottom:14px;">Inicia sesión para personalizar tu foto de perfil, bio, género, cumpleaños y nombre.</p>
+          <p class="muted" style="margin-bottom:14px;">Inicia sesión para ver tu nivel, marco de perfil, foto con zoom y personalización.</p>
           <button class="btn btn-primary" onclick="App.openAuthModal('login')">Iniciar Sesión</button>
         </div>
       `;
@@ -1394,6 +1654,73 @@ const App = {
     if (ageInput && autoAge !== "") ageInput.value = autoAge;
   },
 
+  renderLevelProgressCard(u) {
+    const lvl = u.level || {
+      ...this.getLevelInfo(u.level_index || 0),
+      recharges: 0,
+      baseIndex: u.level_index || 0,
+      baseName: this.getLevelInfo(u.level_index || 0).name,
+      nextTarget: 50,
+      nextName: "Hierro",
+      isPenalized: false,
+      recoveryMinUsd: 5,
+      daysUntilDecay: null
+    };
+
+    const recharges = Number(lvl.recharges || 0);
+    const currentBaseMin = this.getLevelInfo(lvl.baseIndex ?? lvl.index).min;
+    const progressPct = lvl.nextTarget
+      ? Math.min(100, Math.max(0, Math.round(((recharges - currentBaseMin) / Math.max(1, lvl.nextTarget - currentBaseMin)) * 100)))
+      : 100;
+
+    return `
+      <div class="glass profile-card level-card level-card-${lvl.slug}">
+        <div class="level-card-header">
+          <div>
+            <span class="muted" style="font-size:0.78rem;text-transform:uppercase;letter-spacing:0.6px;">Rango de Recargas</span>
+            <div style="display:flex;align-items:center;gap:10px;margin-top:4px;flex-wrap:wrap;">
+              ${this.renderLevelBadge(lvl.index)}
+              <strong style="font-size:0.95rem;">${recharges} recargas completadas</strong>
+            </div>
+          </div>
+          <div style="text-align:right;">
+            ${lvl.nextTarget
+              ? `<span class="muted" style="font-size:0.82rem;">Siguiente: <strong>${this.esc(lvl.nextName)}</strong> (${lvl.nextTarget})</span>`
+              : `<span class="badge">✨ RANGO MÁXIMO</span>`}
+          </div>
+        </div>
+
+        <div class="level-progress-track">
+          <div class="level-progress-fill level-fill-${lvl.slug}" style="width:${progressPct}%"></div>
+        </div>
+
+        ${lvl.isPenalized ? `
+          <div class="level-alert">
+            ⚠️ Tu nivel bajó por pasar más de 20 días sin recargar. Completa una recarga nueva de <strong>$${Number(lvl.recoveryMinUsd || 5).toFixed(2)} USD o más</strong> para recuperar automáticamente tu rango <strong>${this.esc(lvl.baseName)}</strong> con tus ${recharges} recargas acumuladas.
+          </div>
+        ` : lvl.index > 0 && lvl.daysUntilDecay !== null ? `
+          <p class="hint" style="margin-top:10px;">
+            ⏳ Regla de actividad: mantén tu rango recargando antes de <strong>${lvl.daysUntilDecay} día${lvl.daysUntilDecay === 1 ? "" : "s"}</strong> (si bajas por inactividad, lo recuperas con una recarga de $5+ USD).
+          </p>
+        ` : `
+          <p class="hint" style="margin-top:10px;">
+            Cada recarga completada suma para desbloquear insignias y marcos exclusivos de perfil.
+          </p>
+        `}
+
+        <div class="levels-roadmap">
+          ${this.levels.map(r => `
+            <div class="roadmap-item ${r.index === lvl.index ? "current" : ""} ${r.index <= lvl.index ? "unlocked" : ""}">
+              <span class="roadmap-icon">${r.icon}</span>
+              <span class="roadmap-name">${this.esc(r.name)}</span>
+              <span class="roadmap-min">${r.min === 0 ? "< 50" : `${r.min}+`}</span>
+            </div>
+          `).join("")}
+        </div>
+      </div>
+    `;
+  },
+
   paintProfile() {
     const box = document.getElementById("profile-container");
     const u = this.currentUser;
@@ -1401,12 +1728,16 @@ const App = {
 
     const pendingReq = this.profileData.requests.find(r => r.status === "Pendiente");
     const genders = ["", "Masculino", "Femenino", "No binario", "Prefiero no decir"];
+    const lvlIdx = Number(u.level?.index ?? u.level_index ?? 0);
 
     box.innerHTML = `
+      ${this.renderLevelProgressCard(u)}
+
       <div class="glass profile-card">
         <div class="profile-top">
           <div class="profile-avatar-col">
-            ${this.renderAvatar(u.avatar_url, u.name, "avatar-xl")}
+            ${this.renderAvatar(u.avatar_url, u.name, "avatar-xl", lvlIdx)}
+            <div style="margin-top:10px;">${this.renderLevelBadge(lvlIdx)}</div>
             <label class="btn btn-outline btn-sm" style="cursor:pointer;margin-top:10px;">
               📷 Cambiar Foto + Zoom
               <input type="file" accept="image/*" style="display:none;" onchange="App.openAvatarCropper(this)" />
@@ -1453,7 +1784,7 @@ const App = {
         </div>
       </div>
 
-      <div class="glass profile-card" style="margin-top:18px;">
+      <div class="glass profile-card">
         <h4 style="margin-bottom:12px;">Solicitudes de Cambio de Nombre ($5 USD)</h4>
         ${this.profileData.requests.length ? this.profileData.requests.map(r => `
           <div class="order-card" style="padding:12px 0;border-bottom:1px solid rgba(255,255,255,0.08);">
@@ -1687,7 +2018,7 @@ const App = {
     return `https://wa.me/${phone}?text=${encodeURIComponent(text)}`;
   },
 
-  /* ================= CHECKOUT (LOGIN OBLIGATORIO + CAPTURA + WHATSAPP) ================= */
+  /* ================= CHECKOUT (LOGIN + CÓDIGO DESCUENTO/REFERIDO + CAPTURA + WHATSAPP) ================= */
   startCheckout(gameId) {
     if (!this.currentUser || !this.userToken) {
       this.pendingGameId = gameId;
@@ -1710,6 +2041,9 @@ const App = {
       confirmedId: false,
       packageId: game.packages[0]?.id || null,
       paymentId: this.state.payments.find(p => p.active)?.id || null,
+      promoInput: "",
+      appliedPromo: null,
+      checkingPromo: false,
       reference: "",
       receiptBlob: null,
       receiptPreviewUrl: "",
@@ -1725,6 +2059,46 @@ const App = {
 
     this.renderCheckoutStep();
     this.openModal("modal-checkout");
+  },
+
+  async applyPromoCode() {
+    const c = this.checkout;
+    const raw = (document.getElementById("chk-promo-code")?.value || c.promoInput || "").trim().toUpperCase();
+    if (!raw) return this.toast("Ingresa un código primero.");
+
+    c.promoInput = raw;
+    c.checkingPromo = true;
+    this.renderCheckoutStep();
+
+    try {
+      const data = await this.api("promo/validate", {
+        method: "POST",
+        body: {
+          code: raw,
+          gameId: c.gameId,
+          packageId: c.packageId
+        }
+      });
+      c.appliedPromo = data;
+      if (data.discountUsd > 0) {
+        this.toast(`Código ${data.code} aplicado: -${this.formatUsd(data.discountUsd)}`);
+      } else {
+        this.toast(`Código de referido ${data.code} aplicado ✓`);
+      }
+    } catch (err) {
+      c.appliedPromo = null;
+      this.toast(err.message);
+    } finally {
+      c.checkingPromo = false;
+      this.renderCheckoutStep();
+    }
+  },
+
+  removePromoCode() {
+    this.checkout.appliedPromo = null;
+    this.checkout.promoInput = "";
+    this.renderCheckoutStep();
+    this.toast("Código quitado.");
   },
 
   renderCheckoutStep() {
@@ -1786,17 +2160,45 @@ const App = {
       const selectedPay = activePayments.find(p => p.id === c.paymentId) || activePayments[0];
       if (selectedPay) c.paymentId = selectedPay.id;
 
+      const origPrice = Number(pkg.priceUsd);
+      const finalPrice = c.appliedPromo ? Number(c.appliedPromo.finalPriceUsd) : origPrice;
+      const discountUsd = c.appliedPromo ? Number(c.appliedPromo.discountUsd) : 0;
+
       const totalDisplay = selectedPay?.currency === "VES"
-        ? `${this.formatBs(pkg.priceUsd)} (${this.formatUsd(pkg.priceUsd)})`
-        : this.formatUsd(pkg.priceUsd);
+        ? `${this.formatBs(finalPrice)} (${this.formatUsd(finalPrice)})`
+        : this.formatUsd(finalPrice);
 
       body.innerHTML = `
         <h4>Paso 3: Realiza el pago y sube tu comprobante</h4>
-        <p class="muted" style="font-size:0.86rem;">Paquete: <strong>${this.esc(pkg.name)}</strong> — Total: <strong style="color:var(--accent)">${totalDisplay}</strong></p>
+        <p class="muted" style="font-size:0.86rem;">
+          Paquete: <strong>${this.esc(pkg.name)}</strong> — Total:
+          ${discountUsd > 0 ? `<span class="price-strike">${this.formatUsd(origPrice)}</span> ` : ""}
+          <strong style="color:var(--accent)">${totalDisplay}</strong>
+        </p>
+
+        <div class="promo-box">
+          <label class="field-label" style="margin-top:0;">Código de descuento o referido (opcional)</label>
+          <div class="promo-input-row">
+            <input type="text" id="chk-promo-code" class="input" maxlength="24"
+              value="${this.esc(c.appliedPromo ? c.appliedPromo.code : c.promoInput)}"
+              ${c.appliedPromo ? "readonly" : ""}
+              oninput="App.checkout.promoInput = this.value.toUpperCase()"
+              placeholder="Ej: ARCAN10" />
+            ${c.appliedPromo
+              ? `<button type="button" class="btn btn-danger btn-sm" onclick="App.removePromoCode()">Quitar</button>`
+              : `<button type="button" class="btn btn-outline btn-sm" onclick="App.applyPromoCode()" ${c.checkingPromo ? "disabled" : ""}>${c.checkingPromo ? "..." : "Aplicar"}</button>`}
+          </div>
+          ${c.appliedPromo ? `
+            <div class="promo-applied-note">
+              🎟️ Código <strong>${this.esc(c.appliedPromo.code)}</strong> aplicado
+              ${discountUsd > 0 ? ` — Descuento: <strong>-${this.formatUsd(discountUsd)}</strong>` : " (código de referido registrado)"}
+            </div>
+          ` : ""}
+        </div>
 
         <div class="pay-methods">
           ${activePayments.map(m => `
-            <button class="pay-option ${m.id === c.paymentId ? "selected" : ""}" onclick="App.selectPayment('${m.id}')">
+            <button type="button" class="pay-option ${m.id === c.paymentId ? "selected" : ""}" onclick="App.selectPayment('${m.id}')">
               <strong>${this.esc(m.name)}</strong>
               <div class="muted" style="font-size:0.78rem;">Moneda: ${m.currency}</div>
             </button>
@@ -1807,7 +2209,7 @@ const App = {
           <div class="pay-details-box">
             <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
               <strong>Datos para ${this.esc(selectedPay.name)}:</strong>
-              <button class="btn btn-outline btn-sm" onclick="App.copyPaymentDetails('${selectedPay.id}')">Copiar datos</button>
+              <button type="button" class="btn btn-outline btn-sm" onclick="App.copyPaymentDetails('${selectedPay.id}')">Copiar datos</button>
             </div>
             <pre>${this.esc(selectedPay.details)}</pre>
           </div>
@@ -1830,8 +2232,8 @@ const App = {
         </label>
 
         <div class="checkout-actions">
-          <button class="btn btn-outline" onclick="App.setCheckoutStep(2)" ${c.submitting ? "disabled" : ""}>← Atrás</button>
-          <button class="btn btn-primary" onclick="App.submitOrder()" ${c.submitting ? "disabled" : ""}>
+          <button type="button" class="btn btn-outline" onclick="App.setCheckoutStep(2)" ${c.submitting ? "disabled" : ""}>← Atrás</button>
+          <button type="button" class="btn btn-primary" onclick="App.submitOrder()" ${c.submitting ? "disabled" : ""}>
             ${c.submitting ? "Guardando pedido..." : "Confirmar Recarga ✓"}
           </button>
         </div>
@@ -1853,6 +2255,7 @@ const App = {
           <div><strong>Paquete:</strong> ${this.esc(o.package_name)}</div>
           <div><strong>ID Jugador:</strong> ${this.esc(o.player_id)}${o.zone_id ? ` (Zona: ${this.esc(o.zone_id)})` : ""}</div>
           <div><strong>Pago:</strong> ${this.esc(o.payment_name)} — Ref: <strong>${this.esc(o.reference)}</strong></div>
+          ${o.promo_code ? `<div><strong>Código:</strong> ${this.esc(o.promo_code)}${o.discount_usd > 0 ? ` (-${this.formatUsd(o.discount_usd)})` : ""}</div>` : ""}
           <div><strong>Monto:</strong> ${this.esc(o.amount_display)}</div>
           <div><strong>Estado:</strong> <span class="status-pill status-${o.status}">${o.status}</span></div>
         </div>
@@ -1901,7 +2304,10 @@ const App = {
   },
 
   selectPackage(pkgId) {
-    this.checkout.packageId = pkgId;
+    if (this.checkout.packageId !== pkgId) {
+      this.checkout.packageId = pkgId;
+      this.checkout.appliedPromo = null;
+    }
     this.renderCheckoutStep();
   },
 
@@ -1956,6 +2362,7 @@ const App = {
           playerId: this.checkout.playerId,
           zoneId: this.checkout.zoneId,
           nickname: this.checkout.nickname,
+          promoCode: this.checkout.appliedPromo?.code || "",
           reference: ref,
           receiptUrl
         }
@@ -1985,6 +2392,7 @@ const App = {
       `💎 *Paquete:* ${o.package_name}`,
       `🆔 *ID de Jugador:* ${o.player_id}${o.zone_id ? ` (Zona: ${o.zone_id})` : ""}`,
       o.nickname ? `🏷️ *Nickname:* ${o.nickname}` : null,
+      o.promo_code ? `🎟️ *Código:* ${o.promo_code}${Number(o.discount_usd || 0) > 0 ? ` (-${this.formatUsd(o.discount_usd)})` : ""}` : null,
       `💳 *Método:* ${o.payment_name}`,
       `💰 *Monto:* ${o.amount_display}`,
       `🔢 *Referencia:* ${o.reference}`,
@@ -2023,7 +2431,8 @@ const App = {
     const btn = document.getElementById("btn-auth");
     if (!btn) return;
     if (this.currentUser) {
-      btn.innerHTML = `<span class="nav-user-pill">${this.renderAvatar(this.currentUser.avatar_url, this.currentUser.name, "avatar-nav")} <span>${this.esc(this.currentUser.name)}</span></span>`;
+      const lvlIdx = Number(this.currentUser.level?.index ?? this.currentUser.level_index ?? 0);
+      btn.innerHTML = `<span class="nav-user-pill">${this.renderAvatar(this.currentUser.avatar_url, this.currentUser.name, "avatar-nav", lvlIdx)} <span>${this.esc(this.currentUser.name)}</span></span>`;
     } else {
       btn.textContent = "Iniciar Sesión";
     }
@@ -2032,11 +2441,13 @@ const App = {
   openAuthModal(mode = "login", fromCheckout = false) {
     const box = document.getElementById("auth-modal-content");
     if (this.currentUser) {
+      const lvlIdx = Number(this.currentUser.level?.index ?? this.currentUser.level_index ?? 0);
       box.innerHTML = `
         <div style="text-align:center;margin-bottom:16px;">
-          ${this.renderAvatar(this.currentUser.avatar_url, this.currentUser.name, "avatar-lg")}
+          ${this.renderAvatar(this.currentUser.avatar_url, this.currentUser.name, "avatar-lg", lvlIdx)}
           <h3 style="margin-top:10px;">${this.esc(this.currentUser.name)}</h3>
-          <p class="muted" style="font-size:0.86rem;">${this.esc(this.currentUser.email)}</p>
+          <div style="margin-top:6px;">${this.renderLevelBadge(lvlIdx)}</div>
+          <p class="muted" style="font-size:0.86rem;margin-top:6px;">${this.esc(this.currentUser.email)}</p>
         </div>
         <div style="display:flex;flex-direction:column;gap:10px;">
           <button class="btn btn-primary full-width" onclick="App.closeModal('modal-auth'); App.switchView('profile');">Editar Mi Perfil</button>
@@ -2193,6 +2604,7 @@ const App = {
             <strong>${this.esc(o.game_name)} — ${this.esc(o.package_name)}</strong>
             <div class="muted" style="font-size:0.84rem;">
               ${this.esc(o.code)} • ID: ${this.esc(o.player_id)}${o.zone_id ? ` (${this.esc(o.zone_id)})` : ""} • ${this.esc(o.payment_name)} (Ref: ${this.esc(o.reference)})
+              ${o.promo_code ? ` • 🎟️ ${this.esc(o.promo_code)}` : ""}
             </div>
             <div class="muted" style="font-size:0.78rem;">${this.formatDate(o.created_at)}</div>
             <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;">
@@ -2260,6 +2672,7 @@ const App = {
     });
     if (tab === "orders") this.refreshAdminOrders();
     else if (tab === "namechanges") this.refreshAdminNameChanges();
+    else if (tab === "promos") this.refreshAdminPromos();
     else if (tab === "news") this.loadNews();
     else this.renderAdmin();
   },
@@ -2269,6 +2682,7 @@ const App = {
     await Promise.all([
       this.refreshAdminOrders(false),
       this.refreshAdminNameChanges(false),
+      this.refreshAdminPromos(false),
       this.loadNews(false)
     ]);
     this.renderAdmin();
@@ -2290,6 +2704,82 @@ const App = {
       const { requests } = await this.api("admin/name-changes", { token: this.adminToken });
       this.adminNameChanges = requests || [];
       if (render) this.renderAdmin();
+    } catch (err) {
+      this.toast(err.message);
+    }
+  },
+
+  async refreshAdminPromos(render = true) {
+    try {
+      const { promos } = await this.api("admin/promos", { token: this.adminToken });
+      this.adminPromos = promos || [];
+      if (render) this.renderAdmin();
+    } catch (err) {
+      this.toast(err.message);
+    }
+  },
+
+  async createAdminPromo(e) {
+    e.preventDefault();
+    const f = this.promoForm;
+    if (!f.code.trim()) return this.toast("Escribe un código.");
+
+    f.saving = true;
+    this.renderAdmin();
+
+    try {
+      await this.api("admin/promos", {
+        method: "POST",
+        token: this.adminToken,
+        body: {
+          code: f.code.trim().toUpperCase(),
+          owner_name: f.owner_name.trim(),
+          discount_type: f.discount_type,
+          discount_value: parseFloat(f.discount_value) || 0,
+          max_uses: f.max_uses === "" ? null : parseInt(f.max_uses, 10)
+        }
+      });
+
+      this.promoForm = {
+        code: "",
+        owner_name: "",
+        discount_type: "percent",
+        discount_value: 0,
+        max_uses: "",
+        saving: false
+      };
+      this.toast("Código creado correctamente.");
+      await this.refreshAdminPromos();
+    } catch (err) {
+      f.saving = false;
+      this.toast(err.message);
+      this.renderAdmin();
+    }
+  },
+
+  async toggleAdminPromo(promoId, active) {
+    try {
+      await this.api(`admin/promos/${promoId}`, {
+        method: "PATCH",
+        token: this.adminToken,
+        body: { active }
+      });
+      this.toast(active ? "Código activado." : "Código pausado.");
+      await this.refreshAdminPromos();
+    } catch (err) {
+      this.toast(err.message);
+    }
+  },
+
+  async deleteAdminPromo(promoId) {
+    if (!confirm("¿Eliminar este código de descuento / referido?")) return;
+    try {
+      await this.api(`admin/promos/${promoId}`, {
+        method: "DELETE",
+        token: this.adminToken
+      });
+      this.toast("Código eliminado.");
+      await this.refreshAdminPromos();
     } catch (err) {
       this.toast(err.message);
     }
@@ -2640,6 +3130,86 @@ const App = {
           </div>
         `).join("")}
       `;
+    } else if (this.adminTab === "promos") {
+      const f = this.promoForm;
+      box.innerHTML = `
+        <div class="admin-card">
+          <h4>Crear Código de Descuento o Referido</h4>
+          <p class="hint" style="margin-bottom:10px;">El conteo de usos y ventas de cada código solo es visible aquí dentro del Panel de Administrador.</p>
+          <form onsubmit="App.createAdminPromo(event)">
+            <div class="admin-grid-2">
+              <div>
+                <label class="field-label">Código (letras/números sin espacios) *</label>
+                <input class="input" required maxlength="24" value="${this.esc(f.code)}"
+                  oninput="App.promoForm.code = this.value.toUpperCase()" placeholder="Ej: NOIR10" />
+
+                <label class="field-label">Propietario / Referido (opcional)</label>
+                <input class="input" maxlength="60" value="${this.esc(f.owner_name)}"
+                  oninput="App.promoForm.owner_name = this.value" placeholder="Ej: Streamer Juan / Promo Navidad" />
+              </div>
+
+              <div>
+                <div class="admin-grid-2" style="gap:10px;">
+                  <div>
+                    <label class="field-label">Tipo de descuento</label>
+                    <select class="input" onchange="App.promoForm.discount_type = this.value">
+                      <option value="percent" ${f.discount_type === "percent" ? "selected" : ""}>Porcentaje (%)</option>
+                      <option value="fixed" ${f.discount_type === "fixed" ? "selected" : ""}>Monto fijo ($ USD)</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label class="field-label">Valor (0 = solo referido)</label>
+                    <input type="number" step="0.01" min="0" class="input" value="${f.discount_value}"
+                      oninput="App.promoForm.discount_value = this.value" placeholder="0" />
+                  </div>
+                </div>
+
+                <label class="field-label">Límite máximo de usos (vacío = ilimitado)</label>
+                <input type="number" min="1" class="input" value="${this.esc(f.max_uses)}"
+                  oninput="App.promoForm.max_uses = this.value" placeholder="Ilimitado" />
+              </div>
+            </div>
+
+            <div style="display:flex;justify-content:flex-end;margin-top:14px;">
+              <button type="submit" class="btn btn-primary" ${f.saving ? "disabled" : ""}>
+                ${f.saving ? "Creando..." : "+ Crear Código"}
+              </button>
+            </div>
+          </form>
+        </div>
+
+        <h4 style="margin:18px 0 10px;">Códigos Registrados (${this.adminPromos.length})</h4>
+        ${this.adminPromos.length ? this.adminPromos.map(p => {
+          const discLabel = Number(p.discount_value || 0) > 0
+            ? (p.discount_type === "fixed" ? `-${this.formatUsd(p.discount_value)}` : `-${Number(p.discount_value)}%`)
+            : "Solo referido (0%)";
+          return `
+            <div class="admin-card order-card">
+              <div style="flex:1;min-width:240px;">
+                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                  <strong style="font-family:'Orbitron',sans-serif;color:var(--accent);font-size:1.05rem;">${this.esc(p.code)}</strong>
+                  <span class="badge">${discLabel}</span>
+                  <span class="status-pill ${p.active ? "status-Completado" : "status-Rechazado"}">${p.active ? "Activo" : "Pausado"}</span>
+                </div>
+                ${p.owner_name ? `<div class="muted" style="font-size:0.84rem;margin-top:4px;">Propietario: <strong>${this.esc(p.owner_name)}</strong></div>` : ""}
+                <div class="promo-stats-grid">
+                  <div class="promo-stat-chip"><span>Completados</span><strong>${p.completed_uses}</strong></div>
+                  <div class="promo-stat-chip"><span>Pendientes</span><strong>${p.pending_uses}</strong></div>
+                  <div class="promo-stat-chip"><span>Usos totales</span><strong>${p.total_uses}${p.max_uses ? ` / ${p.max_uses}` : ""}</strong></div>
+                  <div class="promo-stat-chip"><span>Ventas</span><strong style="color:var(--accent)">${this.formatUsd(p.total_sales_usd)}</strong></div>
+                  <div class="promo-stat-chip"><span>Descontado</span><strong>${this.formatUsd(p.total_discount_usd)}</strong></div>
+                </div>
+              </div>
+              <div class="row-actions">
+                <button class="btn btn-outline btn-sm" onclick="App.toggleAdminPromo('${p.id}', ${!p.active})">
+                  ${p.active ? "Pausar" : "Activar"}
+                </button>
+                <button class="btn btn-danger btn-sm" onclick="App.deleteAdminPromo('${p.id}')">Eliminar</button>
+              </div>
+            </div>
+          `;
+        }).join("") : `<p class="muted">Todavía no has creado códigos de descuento o referidos.</p>`}
+      `;
     } else if (this.adminTab === "orders") {
       if (!this.adminOrders.length) {
         box.innerHTML = `<p class="muted">Todavía no hay pedidos registrados en la base de datos.</p>`;
@@ -2654,6 +3224,7 @@ const App = {
             </div>
             <div class="muted" style="font-size:0.84rem;">
               Pago: ${this.esc(o.payment_name)} • Ref: <strong>${this.esc(o.reference)}</strong> • Total: ${this.esc(o.amount_display)}
+              ${o.promo_code ? ` • 🎟️ <strong>${this.esc(o.promo_code)}</strong>${Number(o.discount_usd || 0) > 0 ? ` (-${this.formatUsd(o.discount_usd)})` : ""}` : ""}
             </div>
             <div class="muted" style="font-size:0.78rem;">${this.formatDate(o.created_at)}</div>
             ${o.receipt_url ? `<a href="${this.esc(o.receipt_url)}" target="_blank" rel="noopener" class="btn btn-outline btn-sm" style="margin-top:8px;">🧾 Ver Comprobante</a>` : ""}
@@ -2823,6 +3394,7 @@ const App = {
       await this.api(`admin/orders/${orderId}`, { method: "PATCH", token: this.adminToken, body: { status } });
       const o = this.adminOrders.find(x => x.id === orderId);
       if (o) o.status = status;
+      this.refreshAdminPromos(false);
       this.toast(`Pedido actualizado → ${status}`);
     } catch (err) {
       this.toast(err.message);
