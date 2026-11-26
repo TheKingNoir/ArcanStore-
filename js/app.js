@@ -978,7 +978,6 @@ const App = {
     const data = this.getNewsShareData(newsId);
     if (!data) return;
 
-    // En teléfonos con soporte nativo abre el selector del sistema (WhatsApp, IG, X, Telegram, etc.)
     if (navigator.share) {
       try {
         await navigator.share({
