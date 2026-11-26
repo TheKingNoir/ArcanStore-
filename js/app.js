@@ -1,5 +1,6 @@
 const USER_TOKEN_KEY = "arcan_user_token";
 const ADMIN_TOKEN_KEY = "arcan_admin_token";
+const NAME_CHANGE_PRICE_USD = 5.0;
 
 const App = {
   state: null,
@@ -9,7 +10,46 @@ const App = {
   adminTab: "games",
   selectedAdminGameId: null,
   adminOrders: [],
+  adminNameChanges: [],
   pendingGameId: null,
+
+  /* Noticias, comentarios y perfiles públicos */
+  newsList: [],
+  newsEmojis: ["🔥", "❤️", "🎮", "😮", "👍", "😂"],
+  openNewsComments: {},
+  newsCommentsCache: {},
+  replyState: {},
+  publicUsers: [],
+  mentionState: {},
+
+  /* Editor de noticias en Admin */
+  newsEditor: {
+    id: null,
+    title: "",
+    tag: "Anuncio",
+    content: "",
+    image_url: "",
+    pinned: false,
+    saving: false
+  },
+
+  /* Perfil propio */
+  profileData: {
+    requests: [],
+    uploadingAvatar: false,
+    savingBio: false
+  },
+
+  /* Modal de cambio de nombre ($5 USD) */
+  nameChange: {
+    newName: "",
+    paymentId: null,
+    reference: "",
+    receiptBlob: null,
+    receiptPreviewUrl: "",
+    submitting: false,
+    lastRequest: null
+  },
 
   checkout: {
     gameId: null,
@@ -28,7 +68,7 @@ const App = {
   },
 
   async init() {
-    await Promise.all([this.loadStore(), this.restoreUserSession()]);
+    await Promise.all([this.loadStore(), this.restoreUserSession(), this.loadPublicUsers()]);
     this.applyAppearance();
     this.updateAuthButton();
     this.renderStore();
@@ -73,6 +113,15 @@ const App = {
     }
   },
 
+  async loadPublicUsers() {
+    try {
+      const data = await this.api("users/public");
+      this.publicUsers = data.users || [];
+    } catch {
+      this.publicUsers = [];
+    }
+  },
+
   esc(str) {
     return String(str ?? "")
       .replace(/&/g, "&amp;")
@@ -81,10 +130,22 @@ const App = {
       .replace(/"/g, "&quot;");
   },
 
+  escapeRegex(str) {
+    return String(str).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  },
+
   imgFallback(img, label) {
     img.onerror = null;
     const text = encodeURIComponent((label || "ARCAN").slice(0, 14));
     img.src = `data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='400' height='250'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0%' stop-color='%230f172a'/><stop offset='100%' stop-color='%231e1b4b'/></linearGradient></defs><rect width='100%' height='100%' fill='url(%23g)'/><text x='50%' y='50%' fill='%2300e5ff' font-family='sans-serif' font-size='24' font-weight='bold' text-anchor='middle' dominant-baseline='middle'>${text}</text></svg>`;
+  },
+
+  renderAvatar(url, name, sizeClass = "avatar-md") {
+    const initial = this.esc((name || "?").trim().charAt(0).toUpperCase() || "?");
+    if (url) {
+      return `<img class="avatar ${sizeClass}" src="${this.esc(url)}" alt="${this.esc(name)}" onerror="this.outerHTML='<div class=\\'avatar avatar-fallback ${sizeClass}\\'>${initial}</div>'" />`;
+    }
+    return `<div class="avatar avatar-fallback ${sizeClass}">${initial}</div>`;
   },
 
   toast(msg) {
@@ -171,8 +232,13 @@ const App = {
     });
 
     if (viewName === "store") this.renderStore();
+    if (viewName === "news") this.loadNews();
     if (viewName === "history") this.renderHistory();
-    if (viewName === "admin") this.renderAdmin();
+    if (viewName === "profile") this.renderProfile();
+    if (viewName === "admin") {
+      this.refreshAdminData(false);
+      this.renderAdmin();
+    }
   },
 
   openModal(id) { document.getElementById(id).classList.add("open"); },
@@ -213,6 +279,717 @@ const App = {
         </article>
       `;
     }).join("");
+  },
+
+  /* ================= NOTICIAS PÚBLICAS, REACCIONES Y COMENTARIOS ================= */
+  async loadNews(showToast = false) {
+    const feed = document.getElementById("news-feed");
+    if (feed && !this.newsList.length) {
+      feed.innerHTML = `<div class="glass" style="padding:26px;text-align:center;">Cargando noticias...</div>`;
+    }
+    try {
+      const data = await this.api("news", { token: this.userToken });
+      this.newsList = data.news || [];
+      if (Array.isArray(data.emojis) && data.emojis.length) this.newsEmojis = data.emojis;
+      if (showToast) this.toast("Noticias actualizadas.");
+      this.renderNewsFeed();
+      if (this.adminTab === "news" && this.adminToken) this.renderAdmin();
+    } catch (err) {
+      if (feed) feed.innerHTML = `<div class="glass" style="padding:24px;text-align:center;">${this.esc(err.message)}</div>`;
+    }
+  },
+
+  renderNewsFeed() {
+    const feed = document.getElementById("news-feed");
+    if (!feed) return;
+
+    if (!this.newsList.length) {
+      feed.innerHTML = `
+        <div class="glass" style="padding:30px;text-align:center;">
+          <p class="muted">Todavía no hay noticias publicadas. Vuelve pronto para ver anuncios, torneos y ofertas.</p>
+        </div>
+      `;
+      return;
+    }
+
+    feed.innerHTML = this.newsList.map(n => {
+      const commentsOpen = Boolean(this.openNewsComments[n.id]);
+      const reactionsHtml = this.newsEmojis.map(emoji => {
+        const info = n.reactions?.[emoji] || { count: 0, reacted: false };
+        return `
+          <button class="reaction-btn ${info.reacted ? "active" : ""}" onclick="App.toggleReaction('${n.id}', '${emoji}')">
+            <span>${emoji}</span>
+            <span class="reaction-count">${info.count}</span>
+          </button>
+        `;
+      }).join("");
+
+      return `
+        <article class="glass news-card" id="news-card-${n.id}">
+          <div class="news-card-header">
+            <div class="news-badges">
+              ${n.pinned ? `<span class="badge badge-pin">📌 FIJADO</span>` : ""}
+              <span class="badge">${this.esc(n.tag || "Anuncio")}</span>
+            </div>
+            <span class="muted news-date">${this.formatDate(n.created_at)}</span>
+          </div>
+
+          <h3 class="news-title">${this.esc(n.title)}</h3>
+
+          ${n.image_url ? `
+            <div class="news-image-wrap">
+              <img src="${this.esc(n.image_url)}" alt="${this.esc(n.title)}" onerror="App.imgFallback(this, 'NOTICIA')" />
+            </div>
+          ` : ""}
+
+          <div class="news-content">${this.esc(n.content).replace(/\n/g, "<br>")}</div>
+
+          <div class="news-actions-bar">
+            <div class="reactions-row">${reactionsHtml}</div>
+            <button class="btn btn-outline btn-sm" onclick="App.toggleComments('${n.id}')">
+              💬 Comentarios (${n.comments_count || 0})
+            </button>
+          </div>
+
+          ${commentsOpen ? `<div class="comments-section" id="comments-box-${n.id}">${this.renderCommentsHtml(n.id)}</div>` : ""}
+        </article>
+      `;
+    }).join("");
+  },
+
+  async toggleReaction(newsId, emoji) {
+    if (!this.currentUser || !this.userToken) {
+      this.toast("Inicia sesión para reaccionar a las noticias.");
+      this.openAuthModal("login");
+      return;
+    }
+
+    try {
+      const { reactions } = await this.api(`news/${newsId}/react`, {
+        method: "POST",
+        token: this.userToken,
+        body: { emoji }
+      });
+      const item = this.newsList.find(n => n.id === newsId);
+      if (item) item.reactions = reactions;
+      this.renderNewsFeed();
+    } catch (err) {
+      this.toast(err.message);
+    }
+  },
+
+  async toggleComments(newsId) {
+    const isOpen = Boolean(this.openNewsComments[newsId]);
+    if (isOpen) {
+      delete this.openNewsComments[newsId];
+      this.renderNewsFeed();
+      return;
+    }
+
+    this.openNewsComments[newsId] = true;
+    this.renderNewsFeed();
+
+    if (!this.publicUsers.length) await this.loadPublicUsers();
+    await this.loadComments(newsId);
+  },
+
+  async loadComments(newsId) {
+    try {
+      const { comments } = await this.api(`news/${newsId}/comments`);
+      this.newsCommentsCache[newsId] = comments || [];
+      const item = this.newsList.find(n => n.id === newsId);
+      if (item) item.comments_count = (comments || []).length;
+      this.renderNewsFeed();
+    } catch (err) {
+      this.toast(err.message);
+    }
+  },
+
+  formatCommentContent(text) {
+    const safe = this.esc(text);
+    const known = [...this.publicUsers]
+      .filter(u => u.name)
+      .sort((a, b) => b.name.length - a.name.length);
+
+    if (known.length) {
+      const mapByLower = new Map(known.map(u => [this.esc(u.name).toLowerCase(), u]));
+      const pattern = known.map(u => this.escapeRegex(this.esc(u.name))).join("|");
+      const regex = new RegExp(`@(${pattern})(?![\\wÁÉÍÓÚáéíóúÑñ])`, "gi");
+      return safe
+        .replace(regex, (match, captured) => {
+          const found = mapByLower.get(captured.toLowerCase());
+          if (!found) return match;
+          return `<button type="button" class="mention-chip" onclick="App.openPublicProfile('${found.id}')">@${this.esc(found.name)}</button>`;
+        })
+        .replace(/\n/g, "<br>");
+    }
+
+    return safe
+      .replace(/@([A-Za-z0-9_ÁÉÍÓÚáéíóúÑñ-]{2,32})/g, `<span class="mention-chip">@$1</span>`)
+      .replace(/\n/g, "<br>");
+  },
+
+  renderCommentItem(c, newsId, isReply = false) {
+    const canDelete = Boolean(
+      (this.currentUser && this.currentUser.id === c.user_id) || this.adminToken
+    );
+
+    return `
+      <div class="comment-item ${isReply ? "comment-reply" : ""}">
+        <button type="button" class="avatar-btn" onclick="App.openPublicProfile('${c.user_id}')">
+          ${this.renderAvatar(c.user_avatar, c.user_name, isReply ? "avatar-xs" : "avatar-sm")}
+        </button>
+        <div class="comment-body">
+          <div class="comment-meta">
+            <button type="button" class="comment-author" onclick="App.openPublicProfile('${c.user_id}')">
+              ${this.esc(c.user_name)}
+            </button>
+            ${c.reply_to_name ? `<span class="reply-badge">↳ @${this.esc(c.reply_to_name)}</span>` : ""}
+            <span class="muted comment-time">${this.formatDate(c.created_at)}</span>
+          </div>
+          <div class="comment-text">${this.formatCommentContent(c.content)}</div>
+          <div class="comment-actions">
+            <button type="button" class="text-btn" onclick="App.startReply('${newsId}', '${c.id}', '${c.user_id}', '${this.esc(c.user_name).replace(/'/g, "\\'")}')">
+              Responder
+            </button>
+            ${canDelete ? `
+              <button type="button" class="text-btn text-danger" onclick="App.deleteComment('${newsId}', '${c.id}')">
+                Eliminar
+              </button>
+            ` : ""}
+          </div>
+        </div>
+      </div>
+    `;
+  },
+
+  renderCommentsHtml(newsId) {
+    const comments = this.newsCommentsCache[newsId];
+    if (!comments) {
+      return `<p class="muted" style="padding:10px 0;font-size:0.86rem;">Cargando comentarios...</p>`;
+    }
+
+    const roots = comments.filter(c => !c.parent_id);
+    const repliesMap = {};
+    for (const c of comments) {
+      if (c.parent_id) {
+        if (!repliesMap[c.parent_id]) repliesMap[c.parent_id] = [];
+        repliesMap[c.parent_id].push(c);
+      }
+    }
+
+    const replyTarget = this.replyState[newsId];
+    const listHtml = roots.length
+      ? roots.map(root => `
+          <div class="comment-thread">
+            ${this.renderCommentItem(root, newsId, false)}
+            ${(repliesMap[root.id] || []).map(rep => this.renderCommentItem(rep, newsId, true)).join("")}
+          </div>
+        `).join("")
+      : `<p class="muted" style="font-size:0.86rem;margin-bottom:12px;">Sé el primero en comentar esta noticia.</p>`;
+
+    const composerHtml = this.currentUser
+      ? `
+        <div class="comment-composer">
+          ${replyTarget ? `
+            <div class="reply-banner">
+              <span>Respondiendo a <strong>@${this.esc(replyTarget.replyToName)}</strong></span>
+              <button type="button" class="text-btn" onclick="App.cancelReply('${newsId}')">✕ Cancelar</button>
+            </div>
+          ` : ""}
+          <div class="mention-wrap">
+            <textarea id="comment-input-${newsId}" rows="2" class="input"
+              placeholder="Escribe un comentario... Usa @ para etiquetar jugadores"
+              oninput="App.handleMentionInput('${newsId}', this)"></textarea>
+            <div id="mention-list-${newsId}" class="mention-dropdown"></div>
+          </div>
+          <div style="display:flex;justify-content:flex-end;margin-top:8px;">
+            <button type="button" class="btn btn-primary btn-sm" onclick="App.submitComment('${newsId}')">Publicar comentario</button>
+          </div>
+        </div>
+      `
+      : `
+        <div class="comment-login-prompt">
+          <span class="muted">Inicia sesión para comentar, responder y etiquetar usuarios.</span>
+          <button type="button" class="btn btn-primary btn-sm" onclick="App.openAuthModal('login')">Iniciar Sesión</button>
+        </div>
+      `;
+
+    return `
+      <div class="comments-list">${listHtml}</div>
+      ${composerHtml}
+    `;
+  },
+
+  startReply(newsId, commentId, userId, userName) {
+    if (!this.currentUser || !this.userToken) {
+      this.toast("Inicia sesión para responder comentarios.");
+      this.openAuthModal("login");
+      return;
+    }
+    this.replyState[newsId] = { parentId: commentId, replyToUserId: userId, replyToName: userName };
+    this.renderNewsFeed();
+    setTimeout(() => {
+      const input = document.getElementById(`comment-input-${newsId}`);
+      if (input) {
+        if (!input.value.includes(`@${userName}`)) {
+          input.value = `@${userName} ${input.value}`;
+        }
+        input.focus();
+      }
+    }, 30);
+  },
+
+  cancelReply(newsId) {
+    delete this.replyState[newsId];
+    this.renderNewsFeed();
+  },
+
+  handleMentionInput(newsId, textarea) {
+    const box = document.getElementById(`mention-list-${newsId}`);
+    if (!box) return;
+
+    const pos = textarea.selectionStart;
+    const before = textarea.value.slice(0, pos);
+    const match = before.match(/(?:^|\s)@([^\s@]{0,24})$/);
+
+    if (!match) {
+      box.classList.remove("open");
+      box.innerHTML = "";
+      return;
+    }
+
+    const query = match[1].toLowerCase();
+    const matches = this.publicUsers
+      .filter(u => u.name.toLowerCase().includes(query))
+      .slice(0, 6);
+
+    if (!matches.length) {
+      box.classList.remove("open");
+      box.innerHTML = "";
+      return;
+    }
+
+    box.innerHTML = matches.map(u => `
+      <button type="button" class="mention-option" onmousedown="event.preventDefault(); App.insertMention('${newsId}', '${this.esc(u.name).replace(/'/g, "\\'")}')">
+        ${this.renderAvatar(u.avatar_url, u.name, "avatar-xs")}
+        <span>${this.esc(u.name)}</span>
+      </button>
+    `).join("");
+    box.classList.add("open");
+  },
+
+  insertMention(newsId, userName) {
+    const textarea = document.getElementById(`comment-input-${newsId}`);
+    const box = document.getElementById(`mention-list-${newsId}`);
+    if (!textarea) return;
+
+    const pos = textarea.selectionStart;
+    const before = textarea.value.slice(0, pos);
+    const after = textarea.value.slice(pos);
+    const updatedBefore = before.replace(/@([^\s@]{0,24})$/, `@${userName} `);
+
+    textarea.value = updatedBefore + after;
+    textarea.focus();
+    textarea.setSelectionRange(updatedBefore.length, updatedBefore.length);
+    if (box) {
+      box.classList.remove("open");
+      box.innerHTML = "";
+    }
+  },
+
+  async submitComment(newsId) {
+    if (!this.currentUser || !this.userToken) {
+      this.openAuthModal("login");
+      return;
+    }
+
+    const input = document.getElementById(`comment-input-${newsId}`);
+    const content = (input?.value || "").trim();
+    if (!content) return this.toast("Escribe un comentario antes de enviar.");
+
+    const reply = this.replyState[newsId] || {};
+    try {
+      const { comment } = await this.api(`news/${newsId}/comments`, {
+        method: "POST",
+        token: this.userToken,
+        body: {
+          content,
+          parentId: reply.parentId || null,
+          replyToUserId: reply.replyToUserId || null
+        }
+      });
+
+      if (!this.newsCommentsCache[newsId]) this.newsCommentsCache[newsId] = [];
+      this.newsCommentsCache[newsId].push(comment);
+      const item = this.newsList.find(n => n.id === newsId);
+      if (item) item.comments_count = (item.comments_count || 0) + 1;
+      delete this.replyState[newsId];
+      this.renderNewsFeed();
+      this.toast("Comentario publicado.");
+    } catch (err) {
+      this.toast(err.message);
+    }
+  },
+
+  async deleteComment(newsId, commentId) {
+    if (!confirm("¿Eliminar este comentario?")) return;
+    try {
+      const useAdmin = Boolean(this.adminToken && (!this.currentUser || this.newsCommentsCache[newsId]?.find(c => c.id === commentId)?.user_id !== this.currentUser.id));
+      const endpoint = useAdmin ? `admin/comments/${commentId}` : `news/comments/${commentId}`;
+      const token = useAdmin ? this.adminToken : this.userToken;
+
+      await this.api(endpoint, { method: "DELETE", token });
+      await this.loadComments(newsId);
+      this.toast("Comentario eliminado.");
+    } catch (err) {
+      this.toast(err.message);
+    }
+  },
+
+  async openPublicProfile(userId) {
+    const box = document.getElementById("public-profile-content");
+    box.innerHTML = `<p class="muted" style="text-align:center;padding:20px;">Cargando perfil...</p>`;
+    this.openModal("modal-public-profile");
+
+    try {
+      const { user } = await this.api(`users/${userId}`);
+      box.innerHTML = `
+        <div class="public-profile-card">
+          ${this.renderAvatar(user.avatar_url, user.name, "avatar-lg")}
+          <h3 style="margin-top:12px;">${this.esc(user.name)}</h3>
+          <p class="public-bio">${user.bio ? this.esc(user.bio) : "<span class='muted'>Sin descripción todavía.</span>"}</p>
+          <span class="muted" style="font-size:0.78rem;">Miembro desde ${this.formatDate(user.created_at)}</span>
+        </div>
+      `;
+    } catch (err) {
+      box.innerHTML = `<p class="muted" style="text-align:center;padding:20px;">${this.esc(err.message)}</p>`;
+    }
+  },
+
+  /* ================= MI PERFIL Y CAMBIO DE NOMBRE ($5 USD) ================= */
+  async renderProfile() {
+    const box = document.getElementById("profile-container");
+    if (!box) return;
+
+    if (!this.currentUser || !this.userToken) {
+      box.innerHTML = `
+        <div class="glass" style="padding:28px;text-align:center;">
+          <p class="muted" style="margin-bottom:14px;">Inicia sesión para personalizar tu foto de perfil, tu descripción y tu nombre.</p>
+          <button class="btn btn-primary" onclick="App.openAuthModal('login')">Iniciar Sesión</button>
+        </div>
+      `;
+      return;
+    }
+
+    box.innerHTML = `<div class="glass" style="padding:24px;text-align:center;">Cargando tu perfil...</div>`;
+
+    try {
+      const data = await this.api("profile", { token: this.userToken });
+      this.currentUser = data.user;
+      this.profileData.requests = data.requests || [];
+      this.updateAuthButton();
+      this.paintProfile();
+    } catch (err) {
+      box.innerHTML = `<div class="glass" style="padding:24px;text-align:center;">${this.esc(err.message)}</div>`;
+    }
+  },
+
+  paintProfile() {
+    const box = document.getElementById("profile-container");
+    const u = this.currentUser;
+    if (!box || !u) return;
+
+    const pendingReq = this.profileData.requests.find(r => r.status === "Pendiente");
+
+    box.innerHTML = `
+      <div class="glass profile-card">
+        <div class="profile-top">
+          <div class="profile-avatar-col">
+            ${this.renderAvatar(u.avatar_url, u.name, "avatar-xl")}
+            <label class="btn btn-outline btn-sm" style="cursor:pointer;margin-top:10px;">
+              ${this.profileData.uploadingAvatar ? "Subiendo..." : "📷 Cambiar Foto (Gratis)"}
+              <input type="file" accept="image/*" style="display:none;" onchange="App.handleAvatarUpload(this)" ${this.profileData.uploadingAvatar ? "disabled" : ""} />
+            </label>
+          </div>
+
+          <div class="profile-info-col">
+            <div class="profile-name-row">
+              <h3>${this.esc(u.name)}</h3>
+              <button class="btn btn-primary btn-sm" onclick="App.openNameChangeModal()" ${pendingReq ? "disabled" : ""}>
+                ✏️ Cambiar Nombre (${this.formatUsd(NAME_CHANGE_PRICE_USD)})
+              </button>
+            </div>
+            <p class="muted" style="font-size:0.86rem;margin-top:4px;">${this.esc(u.email)}</p>
+            ${pendingReq ? `<p class="hint" style="color:var(--accent);margin-top:8px;">Tienes una solicitud pendiente para cambiar a <strong>${this.esc(pendingReq.new_name)}</strong>.</p>` : ""}
+
+            <label class="field-label" style="margin-top:16px;">Descripción / Bio (Gratis, máx. 240 caracteres)</label>
+            <textarea id="profile-bio-input" rows="3" maxlength="240" class="input" placeholder="Cuéntale a la comunidad qué juegos juegas o tu clan...">${this.esc(u.bio || "")}</textarea>
+            <div style="display:flex;justify-content:flex-end;margin-top:10px;">
+              <button class="btn btn-primary btn-sm" onclick="App.saveProfileBio()" ${this.profileData.savingBio ? "disabled" : ""}>
+                ${this.profileData.savingBio ? "Guardando..." : "Guardar Descripción"}
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="glass profile-card" style="margin-top:18px;">
+        <h4 style="margin-bottom:12px;">Solicitudes de Cambio de Nombre ($5 USD)</h4>
+        ${this.profileData.requests.length ? this.profileData.requests.map(r => `
+          <div class="order-card" style="padding:12px 0;border-bottom:1px solid rgba(255,255,255,0.08);">
+            <div>
+              <strong>${this.esc(r.old_name)} → ${this.esc(r.new_name)}</strong>
+              <div class="muted" style="font-size:0.82rem;">
+                ${this.esc(r.payment_name)} • Ref: ${this.esc(r.reference)} • ${this.esc(r.amount_display)}
+              </div>
+              <div class="muted" style="font-size:0.76rem;">${this.formatDate(r.created_at)}</div>
+              <div style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap;">
+                ${r.receipt_url ? `<a href="${this.esc(r.receipt_url)}" target="_blank" rel="noopener" class="btn btn-outline btn-sm">🧾 Ver captura</a>` : ""}
+                ${r.status === "Pendiente" ? `<a href="${this.buildNameChangeWhatsAppUrl(r)}" target="_blank" rel="noopener" class="btn btn-whatsapp btn-sm">📲 Enviar a WhatsApp</a>` : ""}
+              </div>
+            </div>
+            <span class="status-pill status-${r.status}">${r.status}</span>
+          </div>
+        `).join("") : `<p class="muted" style="font-size:0.88rem;">No has solicitado cambios de nombre todavía.</p>`}
+      </div>
+    `;
+  },
+
+  async handleAvatarUpload(inputEl) {
+    const file = inputEl.files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith("image/")) return this.toast("Selecciona una imagen válida.");
+
+    this.profileData.uploadingAvatar = true;
+    this.paintProfile();
+
+    try {
+      const blob = await this.compressToBlob(file, 450, 0.85);
+      const url = await this.uploadImageToR2(blob, "avatars", this.userToken);
+      const { user } = await this.api("profile", {
+        method: "PATCH",
+        token: this.userToken,
+        body: { avatar_url: url }
+      });
+      this.currentUser = user;
+      this.updateAuthButton();
+      this.loadPublicUsers();
+      this.toast("Foto de perfil actualizada.");
+    } catch (err) {
+      this.toast(err.message);
+    } finally {
+      this.profileData.uploadingAvatar = false;
+      inputEl.value = "";
+      this.paintProfile();
+    }
+  },
+
+  async saveProfileBio() {
+    const bio = (document.getElementById("profile-bio-input")?.value || "").trim();
+    this.profileData.savingBio = true;
+    this.paintProfile();
+
+    try {
+      const { user } = await this.api("profile", {
+        method: "PATCH",
+        token: this.userToken,
+        body: { bio }
+      });
+      this.currentUser = user;
+      this.loadPublicUsers();
+      this.toast("Descripción guardada.");
+    } catch (err) {
+      this.toast(err.message);
+    } finally {
+      this.profileData.savingBio = false;
+      this.paintProfile();
+    }
+  },
+
+  openNameChangeModal() {
+    if (!this.currentUser || !this.userToken) return this.openAuthModal("login");
+    if (this.nameChange.receiptPreviewUrl) URL.revokeObjectURL(this.nameChange.receiptPreviewUrl);
+
+    this.nameChange = {
+      newName: "",
+      paymentId: this.state?.payments?.find(p => p.active)?.id || null,
+      reference: "",
+      receiptBlob: null,
+      receiptPreviewUrl: "",
+      submitting: false,
+      lastRequest: null
+    };
+    this.renderNameChangeModal();
+    this.openModal("modal-name-change");
+  },
+
+  renderNameChangeModal() {
+    const nc = this.nameChange;
+    const box = document.getElementById("name-change-modal-content");
+    if (!box) return;
+
+    if (nc.lastRequest) {
+      const r = nc.lastRequest;
+      const waUrl = this.buildNameChangeWhatsAppUrl(r);
+      box.innerHTML = `
+        <div style="text-align:center;padding:6px 0;">
+          <div style="font-size:2.3rem;">✅</div>
+          <h3 style="margin:6px 0;">Solicitud registrada</h3>
+          <p class="muted">En cuanto confirmemos tu pago de <strong>${this.esc(r.amount_display)}</strong>, tu nombre cambiará automáticamente a <strong style="color:var(--accent)">${this.esc(r.new_name)}</strong>.</p>
+        </div>
+
+        <div class="pay-details-box" style="margin-top:14px;">
+          <div><strong>Nombre actual:</strong> ${this.esc(r.old_name)}</div>
+          <div><strong>Nuevo nombre:</strong> ${this.esc(r.new_name)}</div>
+          <div><strong>Método:</strong> ${this.esc(r.payment_name)} — Ref: <strong>${this.esc(r.reference)}</strong></div>
+          <div><strong>Monto:</strong> ${this.esc(r.amount_display)}</div>
+        </div>
+
+        <div style="display:flex;flex-direction:column;gap:10px;margin-top:14px;">
+          <a href="${waUrl}" target="_blank" rel="noopener" class="btn btn-whatsapp full-width">
+            📲 Enviar comprobante a WhatsApp
+          </a>
+          <button class="btn btn-outline full-width" onclick="App.closeModal('modal-name-change'); App.renderProfile();">
+            Volver a Mi Perfil
+          </button>
+        </div>
+      `;
+      return;
+    }
+
+    const activePayments = (this.state?.payments || []).filter(p => p.active);
+    const selectedPay = activePayments.find(p => p.id === nc.paymentId) || activePayments[0];
+    if (selectedPay) nc.paymentId = selectedPay.id;
+
+    const totalDisplay = selectedPay?.currency === "VES"
+      ? `${this.formatBs(NAME_CHANGE_PRICE_USD)} (${this.formatUsd(NAME_CHANGE_PRICE_USD)})`
+      : this.formatUsd(NAME_CHANGE_PRICE_USD);
+
+    box.innerHTML = `
+      <h3>Solicitar Cambio de Nombre</h3>
+      <p class="muted" style="font-size:0.86rem;margin-top:4px;">
+        Costo único: <strong style="color:var(--accent)">${totalDisplay}</strong>. Tu nombre actual es <strong>${this.esc(this.currentUser.name)}</strong>.
+      </p>
+
+      <label class="field-label">Nuevo nombre deseado *</label>
+      <input type="text" id="nc-new-name" class="input" maxlength="32" value="${this.esc(nc.newName)}"
+        oninput="App.nameChange.newName = this.value" placeholder="Ej: AresNoir" />
+
+      <label class="field-label">Método de pago</label>
+      <div class="pay-methods">
+        ${activePayments.map(m => `
+          <button type="button" class="pay-option ${m.id === nc.paymentId ? "selected" : ""}" onclick="App.nameChange.paymentId='${m.id}'; App.renderNameChangeModal();">
+            <strong>${this.esc(m.name)}</strong>
+            <div class="muted" style="font-size:0.78rem;">Moneda: ${m.currency}</div>
+          </button>
+        `).join("")}
+      </div>
+
+      ${selectedPay ? `
+        <div class="pay-details-box">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
+            <strong>Datos para ${this.esc(selectedPay.name)}:</strong>
+            <button type="button" class="btn btn-outline btn-sm" onclick="App.copyPaymentDetails('${selectedPay.id}')">Copiar datos</button>
+          </div>
+          <pre>${this.esc(selectedPay.details)}</pre>
+        </div>
+      ` : ""}
+
+      <label class="field-label">Código de referencia del pago *</label>
+      <input type="text" id="nc-reference" class="input" value="${this.esc(nc.reference)}"
+        oninput="App.nameChange.reference = this.value" placeholder="Número de referencia o ID de transacción" />
+
+      <label class="field-label">Captura de pantalla del comprobante *</label>
+      <label class="upload-box">
+        ${nc.receiptPreviewUrl
+          ? `<img src="${nc.receiptPreviewUrl}" class="receipt-preview" alt="Comprobante" />
+             <span class="muted" style="font-size:0.8rem;">Toca aquí para cambiar la captura</span>`
+          : `<span style="font-size:1.5rem;">🧾</span>
+             <strong>Subir captura del pago ($5)</strong>
+             <span class="muted" style="font-size:0.8rem;">Selecciona la imagen desde tu galería</span>`}
+        <input type="file" accept="image/*" style="display:none;" onchange="App.handleNameChangeReceipt(this)" />
+      </label>
+
+      <div class="checkout-actions">
+        <button type="button" class="btn btn-outline" onclick="App.closeModal('modal-name-change')" ${nc.submitting ? "disabled" : ""}>Cancelar</button>
+        <button type="button" class="btn btn-primary" onclick="App.submitNameChange()" ${nc.submitting ? "disabled" : ""}>
+          ${nc.submitting ? "Enviando solicitud..." : "Enviar Solicitud ✓"}
+        </button>
+      </div>
+    `;
+  },
+
+  async handleNameChangeReceipt(inputEl) {
+    const file = inputEl.files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith("image/")) return this.toast("Selecciona una imagen válida.");
+
+    try {
+      const blob = await this.compressToBlob(file, 1200, 0.82);
+      if (this.nameChange.receiptPreviewUrl) URL.revokeObjectURL(this.nameChange.receiptPreviewUrl);
+      this.nameChange.receiptBlob = blob;
+      this.nameChange.receiptPreviewUrl = URL.createObjectURL(blob);
+      this.renderNameChangeModal();
+      this.toast("Captura lista.");
+    } catch {
+      this.toast("No se pudo leer la captura.");
+    }
+  },
+
+  async submitNameChange() {
+    const newName = (document.getElementById("nc-new-name")?.value || this.nameChange.newName || "").trim();
+    const reference = (document.getElementById("nc-reference")?.value || this.nameChange.reference || "").trim();
+
+    if (newName.length < 2) return this.toast("Escribe tu nuevo nombre (mínimo 2 caracteres).");
+    if (!reference) return this.toast("Ingresa la referencia del pago.");
+    if (!this.nameChange.receiptBlob) return this.toast("Adjunta la captura del comprobante de pago.");
+
+    this.nameChange.newName = newName;
+    this.nameChange.reference = reference;
+    this.nameChange.submitting = true;
+    this.renderNameChangeModal();
+
+    try {
+      const receiptUrl = await this.uploadImageToR2(this.nameChange.receiptBlob, "receipts", this.userToken);
+      const { request } = await this.api("profile/name-change", {
+        method: "POST",
+        token: this.userToken,
+        body: {
+          newName,
+          paymentId: this.nameChange.paymentId,
+          reference,
+          receiptUrl
+        }
+      });
+
+      this.nameChange.lastRequest = request;
+      this.toast("Solicitud de cambio de nombre enviada.");
+    } catch (err) {
+      this.toast(err.message);
+    } finally {
+      this.nameChange.submitting = false;
+      this.renderNameChangeModal();
+    }
+  },
+
+  buildNameChangeWhatsAppUrl(r) {
+    const phone = String(this.state?.config?.whatsappNumber || "584125891414").replace(/\D/g, "");
+    const receiptFullUrl = r.receipt_url.startsWith("http")
+      ? r.receipt_url
+      : `${window.location.origin}${r.receipt_url}`;
+
+    const text = [
+      `✏️ *SOLICITUD CAMBIO DE NOMBRE - ARCANSTORE*`,
+      `👤 *Nombre actual:* ${r.old_name}`,
+      `✨ *Nuevo nombre:* ${r.new_name}`,
+      `💳 *Método:* ${r.payment_name}`,
+      `💰 *Monto:* ${r.amount_display}`,
+      `🔢 *Referencia:* ${r.reference}`,
+      `🧾 *Comprobante:* ${receiptFullUrl}`
+    ].join("\n");
+
+    return `https://wa.me/${phone}?text=${encodeURIComponent(text)}`;
   },
 
   /* ================= CHECKOUT (LOGIN OBLIGATORIO + CAPTURA + WHATSAPP) ================= */
@@ -549,16 +1326,27 @@ const App = {
   /* ================= LOGIN E HISTORIAL ================= */
   updateAuthButton() {
     const btn = document.getElementById("btn-auth");
-    btn.textContent = this.currentUser ? `👤 ${this.currentUser.name}` : "Iniciar Sesión";
+    if (!btn) return;
+    if (this.currentUser) {
+      btn.innerHTML = `<span class="nav-user-pill">${this.renderAvatar(this.currentUser.avatar_url, this.currentUser.name, "avatar-nav")} <span>${this.esc(this.currentUser.name)}</span></span>`;
+    } else {
+      btn.textContent = "Iniciar Sesión";
+    }
   },
 
   openAuthModal(mode = "login", fromCheckout = false) {
     const box = document.getElementById("auth-modal-content");
     if (this.currentUser) {
       box.innerHTML = `
-        <h3>Mi Cuenta</h3>
-        <p class="muted" style="margin:8px 0 18px;">Sesión activa como <strong>${this.esc(this.currentUser.name)}</strong> (${this.esc(this.currentUser.email)})</p>
-        <button class="btn btn-danger full-width" onclick="App.logout()">Cerrar Sesión</button>
+        <div style="text-align:center;margin-bottom:16px;">
+          ${this.renderAvatar(this.currentUser.avatar_url, this.currentUser.name, "avatar-lg")}
+          <h3 style="margin-top:10px;">${this.esc(this.currentUser.name)}</h3>
+          <p class="muted" style="font-size:0.86rem;">${this.esc(this.currentUser.email)}</p>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:10px;">
+          <button class="btn btn-primary full-width" onclick="App.closeModal('modal-auth'); App.switchView('profile');">Editar Mi Perfil</button>
+          <button class="btn btn-danger full-width" onclick="App.logout()">Cerrar Sesión</button>
+        </div>
       `;
     } else if (mode === "login") {
       box.innerHTML = `
@@ -581,7 +1369,7 @@ const App = {
         ${fromCheckout ? `<p class="hint" style="color:var(--accent);margin:6px 0;">Crea tu cuenta para guardar tu historial y recargar.</p>` : ""}
         <form onsubmit="App.handleRegister(event)">
           <label class="field-label">Nombre / Gamer Tag</label>
-          <input type="text" id="reg-name" class="input" required placeholder="Tu nombre" />
+          <input type="text" id="reg-name" class="input" required maxlength="32" placeholder="Tu nombre" />
           <label class="field-label">Correo</label>
           <input type="email" id="reg-email" class="input" required placeholder="tu@correo.com" />
           <label class="field-label">Contraseña</label>
@@ -608,12 +1396,17 @@ const App = {
         }
       });
       this.setUserSession(data.token, data.user);
+      this.loadPublicUsers();
       this.closeModal("modal-auth");
       this.toast(`¡Bienvenido, ${data.user.name}!`);
       if (this.pendingGameId) {
         const g = this.pendingGameId;
         this.pendingGameId = null;
         this.startCheckout(g);
+      } else if (document.getElementById("view-news").classList.contains("active")) {
+        this.loadNews();
+      } else if (document.getElementById("view-profile").classList.contains("active")) {
+        this.renderProfile();
       }
     } catch (err) {
       this.toast(err.message);
@@ -637,6 +1430,12 @@ const App = {
         const g = this.pendingGameId;
         this.pendingGameId = null;
         this.startCheckout(g);
+      } else if (document.getElementById("view-news").classList.contains("active")) {
+        this.loadNews();
+      } else if (document.getElementById("view-profile").classList.contains("active")) {
+        this.renderProfile();
+      } else if (document.getElementById("view-history").classList.contains("active")) {
+        this.renderHistory();
       }
     } catch (err) {
       this.toast(err.message);
@@ -658,6 +1457,8 @@ const App = {
     this.closeModal("modal-auth");
     this.toast("Sesión cerrada.");
     if (document.getElementById("view-history").classList.contains("active")) this.renderHistory();
+    if (document.getElementById("view-profile").classList.contains("active")) this.renderProfile();
+    if (document.getElementById("view-news").classList.contains("active")) this.loadNews();
   },
 
   async renderHistory() {
@@ -756,14 +1557,37 @@ const App = {
       b.classList.toggle("active", b.dataset.tab === tab);
     });
     if (tab === "orders") this.refreshAdminOrders();
+    else if (tab === "namechanges") this.refreshAdminNameChanges();
+    else if (tab === "news") this.loadNews();
     else this.renderAdmin();
   },
 
-  async refreshAdminOrders() {
+  async refreshAdminData(showToast = true) {
+    if (!this.adminToken) return;
+    await Promise.all([
+      this.refreshAdminOrders(false),
+      this.refreshAdminNameChanges(false),
+      this.loadNews(false)
+    ]);
+    this.renderAdmin();
+    if (showToast) this.toast("Datos de administración actualizados.");
+  },
+
+  async refreshAdminOrders(render = true) {
     try {
       const { orders } = await this.api("admin/orders", { token: this.adminToken });
       this.adminOrders = orders;
-      this.renderAdmin();
+      if (render) this.renderAdmin();
+    } catch (err) {
+      this.toast(err.message);
+    }
+  },
+
+  async refreshAdminNameChanges(render = true) {
+    try {
+      const { requests } = await this.api("admin/name-changes", { token: this.adminToken });
+      this.adminNameChanges = requests || [];
+      if (render) this.renderAdmin();
     } catch (err) {
       this.toast(err.message);
     }
@@ -772,12 +1596,20 @@ const App = {
   async handleAdminImageUpload(inputEl, target, gameId = null, pkgId = null) {
     const file = inputEl.files?.[0];
     if (!file) return;
-    const maxWidth = target === "background" ? 1400 : target === "game" ? 800 : 350;
+    const maxWidth = target === "background" ? 1400 : target === "news" ? 1200 : target === "game" ? 800 : 350;
+    const folder = target === "news" ? "news" : "catalog";
 
     try {
       this.toast("Subiendo imagen...");
       const blob = await this.compressToBlob(file, maxWidth, 0.82);
-      const url = await this.uploadImageToR2(blob, "catalog", this.adminToken);
+      const url = await this.uploadImageToR2(blob, folder, this.adminToken);
+
+      if (target === "news") {
+        this.newsEditor.image_url = url;
+        this.toast("Imagen de noticia lista.");
+        this.renderAdmin();
+        return;
+      }
 
       if (target === "game") {
         const g = this.state.games.find(x => x.id === gameId);
@@ -797,6 +1629,112 @@ const App = {
       this.toast(err.message);
     } finally {
       inputEl.value = "";
+    }
+  },
+
+  resetNewsEditor() {
+    this.newsEditor = {
+      id: null,
+      title: "",
+      tag: "Anuncio",
+      content: "",
+      image_url: "",
+      pinned: false,
+      saving: false
+    };
+    this.renderAdmin();
+  },
+
+  editAdminNews(newsId) {
+    const item = this.newsList.find(n => n.id === newsId);
+    if (!item) return;
+    this.newsEditor = {
+      id: item.id,
+      title: item.title,
+      tag: item.tag || "Anuncio",
+      content: item.content,
+      image_url: item.image_url || "",
+      pinned: Boolean(item.pinned),
+      saving: false
+    };
+    this.renderAdmin();
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  },
+
+  async submitAdminNews(e) {
+    e.preventDefault();
+    const ed = this.newsEditor;
+    if (!ed.title.trim() || !ed.content.trim()) {
+      return this.toast("Completa el título y el contenido de la noticia.");
+    }
+
+    ed.saving = true;
+    this.renderAdmin();
+
+    try {
+      if (ed.id) {
+        await this.api(`admin/news/${ed.id}`, {
+          method: "PUT",
+          token: this.adminToken,
+          body: {
+            title: ed.title.trim(),
+            tag: ed.tag.trim() || "Anuncio",
+            content: ed.content.trim(),
+            image_url: ed.image_url.trim(),
+            pinned: ed.pinned
+          }
+        });
+        this.toast("Noticia actualizada.");
+      } else {
+        await this.api("admin/news", {
+          method: "POST",
+          token: this.adminToken,
+          body: {
+            title: ed.title.trim(),
+            tag: ed.tag.trim() || "Anuncio",
+            content: ed.content.trim(),
+            image_url: ed.image_url.trim(),
+            pinned: ed.pinned
+          }
+        });
+        this.toast("Noticia publicada.");
+      }
+
+      this.resetNewsEditor();
+      await this.loadNews();
+    } catch (err) {
+      ed.saving = false;
+      this.toast(err.message);
+      this.renderAdmin();
+    }
+  },
+
+  async deleteAdminNews(newsId) {
+    if (!confirm("¿Eliminar esta noticia junto con sus reacciones y comentarios?")) return;
+    try {
+      await this.api(`admin/news/${newsId}`, { method: "DELETE", token: this.adminToken });
+      if (this.newsEditor.id === newsId) this.resetNewsEditor();
+      this.toast("Noticia eliminada.");
+      await this.loadNews();
+    } catch (err) {
+      this.toast(err.message);
+    }
+  },
+
+  async resolveNameChange(reqId, status) {
+    const verb = status === "Aprobado" ? "aprobar y cambiar el nombre de este usuario" : "rechazar esta solicitud";
+    if (!confirm(`¿Seguro que deseas ${verb}?`)) return;
+
+    try {
+      await this.api(`admin/name-changes/${reqId}`, {
+        method: "PATCH",
+        token: this.adminToken,
+        body: { status }
+      });
+      this.toast(`Solicitud marcada como ${status}.`);
+      await Promise.all([this.refreshAdminNameChanges(), this.loadPublicUsers()]);
+    } catch (err) {
+      this.toast(err.message);
     }
   },
 
@@ -884,6 +1822,75 @@ const App = {
           </div>
         ` : ""}
       `;
+    } else if (this.adminTab === "news") {
+      const ed = this.newsEditor;
+      box.innerHTML = `
+        <div class="admin-card">
+          <div class="row-actions" style="justify-content:space-between;margin-bottom:10px;">
+            <h4>${ed.id ? "Editar Noticia / Anuncio" : "Publicar Nueva Noticia / Anuncio"}</h4>
+            ${ed.id ? `<button type="button" class="btn btn-outline btn-sm" onclick="App.resetNewsEditor()">Cancelar Edición</button>` : ""}
+          </div>
+
+          <form onsubmit="App.submitAdminNews(event)">
+            <div class="admin-grid-2">
+              <div>
+                <label class="field-label">Título *</label>
+                <input class="input" required value="${this.esc(ed.title)}"
+                  oninput="App.newsEditor.title = this.value" placeholder="Ej: Nuevo torneo de Free Fire" />
+
+                <label class="field-label">Etiqueta</label>
+                <input class="input" maxlength="24" value="${this.esc(ed.tag)}"
+                  oninput="App.newsEditor.tag = this.value" placeholder="Anuncio, Oferta, Torneo..." />
+
+                <label class="checkbox-card" style="margin-top:12px;">
+                  <input type="checkbox" ${ed.pinned ? "checked" : ""} onchange="App.newsEditor.pinned = this.checked" />
+                  <span>📌 Fijar arriba de todas las noticias</span>
+                </label>
+              </div>
+
+              <div>
+                <label class="field-label">Imagen opcional (Galería R2 o URL)</label>
+                <div class="img-preview-row">
+                  ${ed.image_url ? `<img class="img-preview" src="${this.esc(ed.image_url)}" onerror="App.imgFallback(this,'NEWS')" />` : ""}
+                  <label class="btn btn-primary btn-sm" style="cursor:pointer;white-space:nowrap;">
+                    📁 Galería
+                    <input type="file" accept="image/*" style="display:none;" onchange="App.handleAdminImageUpload(this,'news')" />
+                  </label>
+                  <input class="input" value="${this.esc(ed.image_url)}"
+                    oninput="App.newsEditor.image_url = this.value" placeholder="Opcional: URL de imagen" />
+                </div>
+
+                <label class="field-label">Contenido del anuncio *</label>
+                <textarea rows="4" class="input" required oninput="App.newsEditor.content = this.value" placeholder="Escribe los detalles de la noticia...">${this.esc(ed.content)}</textarea>
+              </div>
+            </div>
+
+            <div style="display:flex;justify-content:flex-end;margin-top:14px;">
+              <button type="submit" class="btn btn-primary" ${ed.saving ? "disabled" : ""}>
+                ${ed.saving ? "Guardando..." : ed.id ? "Guardar Cambios" : "Publicar Noticia"}
+              </button>
+            </div>
+          </form>
+        </div>
+
+        <h4 style="margin:18px 0 10px;">Noticias Publicadas (${this.newsList.length})</h4>
+        ${this.newsList.length ? this.newsList.map(n => `
+          <div class="admin-card order-card">
+            <div style="display:flex;gap:12px;align-items:flex-start;">
+              ${n.image_url ? `<img class="img-preview" src="${this.esc(n.image_url)}" onerror="App.imgFallback(this,'NEWS')" />` : ""}
+              <div>
+                <strong>${n.pinned ? "📌 " : ""}${this.esc(n.title)}</strong>
+                <div class="muted" style="font-size:0.8rem;">${this.esc(n.tag)} • ${this.formatDate(n.created_at)} • 💬 ${n.comments_count || 0} comentarios</div>
+                <p class="muted" style="font-size:0.84rem;margin-top:6px;">${this.esc(n.content).slice(0, 140)}${n.content.length > 140 ? "..." : ""}</p>
+              </div>
+            </div>
+            <div class="row-actions">
+              <button class="btn btn-outline btn-sm" onclick="App.editAdminNews('${n.id}')">Editar</button>
+              <button class="btn btn-danger btn-sm" onclick="App.deleteAdminNews('${n.id}')">Eliminar</button>
+            </div>
+          </div>
+        `).join("") : `<p class="muted">Aún no has publicado noticias.</p>`}
+      `;
     } else if (this.adminTab === "payments") {
       box.innerHTML = `
         <div class="admin-grid-2" style="margin-bottom:16px;">
@@ -952,6 +1959,32 @@ const App = {
           <select class="input" style="width:auto;" onchange="App.updateOrderStatus('${o.id}',this.value)">
             ${["Pendiente", "Procesando", "Completado", "Rechazado"].map(s => `<option ${o.status === s ? "selected" : ""}>${s}</option>`).join("")}
           </select>
+        </div>
+      `).join("");
+    } else if (this.adminTab === "namechanges") {
+      if (!this.adminNameChanges.length) {
+        box.innerHTML = `<p class="muted">No hay solicitudes de cambio de nombre ($5 USD) todavía.</p>`;
+        return;
+      }
+      box.innerHTML = this.adminNameChanges.map(r => `
+        <div class="admin-card order-card">
+          <div>
+            <strong>${this.esc(r.old_name)} → <span style="color:var(--accent)">${this.esc(r.new_name)}</span></strong>
+            <div class="muted" style="font-size:0.84rem;">
+              Correo: ${this.esc(r.user_email || "")} • Pago: ${this.esc(r.payment_name)} • Ref: <strong>${this.esc(r.reference)}</strong> • ${this.esc(r.amount_display)}
+            </div>
+            <div class="muted" style="font-size:0.78rem;">${this.formatDate(r.created_at)}</div>
+            <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+              ${r.receipt_url ? `<a href="${this.esc(r.receipt_url)}" target="_blank" rel="noopener" class="btn btn-outline btn-sm">🧾 Ver Comprobante</a>` : ""}
+              <span class="status-pill status-${r.status}">${r.status}</span>
+            </div>
+          </div>
+          ${r.status === "Pendiente" ? `
+            <div class="row-actions">
+              <button class="btn btn-primary btn-sm" onclick="App.resolveNameChange('${r.id}', 'Aprobado')">✓ Aprobar</button>
+              <button class="btn btn-danger btn-sm" onclick="App.resolveNameChange('${r.id}', 'Rechazado')">✕ Rechazar</button>
+            </div>
+          ` : ""}
         </div>
       `).join("");
     } else if (this.adminTab === "appearance") {
