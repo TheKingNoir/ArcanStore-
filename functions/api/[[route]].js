@@ -126,9 +126,23 @@ const DEFAULT_STORE = {
 };
 
 const NAME_CHANGE_PRICE_USD = 5.0;
+const LEVEL_RECOVERY_MIN_USD = 5.0;
+const DECAY_DAYS = 20;
+const DECAY_MS = DECAY_DAYS * 24 * 60 * 60 * 1000;
+
 const ALLOWED_EMOJIS = ["🔥", "❤️", "🎮", "😮", "👍", "😂"];
 const COMMENT_EMOJIS = ["❤️", "🔥", "😂", "😮", "👍"];
 const ALLOWED_GENDERS = ["", "Masculino", "Femenino", "No binario", "Prefiero no decir"];
+
+const LEVELS = [
+  { index: 0, name: "Bronce", slug: "bronze", icon: "🥉", min: 0 },
+  { index: 1, name: "Hierro", slug: "iron", icon: "🛡️", min: 50 },
+  { index: 2, name: "Plata", slug: "silver", icon: "⚔️", min: 100 },
+  { index: 3, name: "Oro", slug: "gold", icon: "👑", min: 150 },
+  { index: 4, name: "Esmeralda", slug: "emerald", icon: "❇️", min: 200 },
+  { index: 5, name: "Diamante", slug: "diamond", icon: "💎", min: 250 },
+  { index: 6, name: "Rubí", slug: "ruby", icon: "❤️‍🔥", min: 300 }
+];
 
 /* ================= UTILIDADES CRYPTO & JSON ================= */
 const enc = new TextEncoder();
@@ -142,6 +156,10 @@ function json(data, status = 200) {
 
 function escapeRegex(str) {
   return String(str).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function normalizePromoCode(raw) {
+  return String(raw || "").trim().toUpperCase().replace(/[^A-Z0-9_-]/g, "").slice(0, 24);
 }
 
 function toBase64Url(bytes) {
@@ -226,6 +244,243 @@ function calculateAgeFromBirthday(birthday) {
   return age >= 10 && age <= 120 ? age : null;
 }
 
+/* ================= SISTEMA DE NIVELES (20 DÍAS INACTIVIDAD + RECUPERACIÓN $5) ================= */
+function getBaseLevelIndex(completedRecharges) {
+  let idx = 0;
+  for (const lvl of LEVELS) {
+    if (completedRecharges >= lvl.min) idx = lvl.index;
+  }
+  return idx;
+}
+
+function buildLevelPayload(effectiveIndex, baseIndex, completedRecharges, lastActivityIso = null) {
+  const safeIdx = Math.max(0, Math.min(LEVELS.length - 1, Number(effectiveIndex || 0)));
+  const safeBase = Math.max(0, Math.min(LEVELS.length - 1, Number(baseIndex ?? safeIdx)));
+  const current = LEVELS[safeIdx];
+  const baseLvl = LEVELS[safeBase];
+  const nextLvl = LEVELS[safeBase + 1] || null;
+
+  let daysUntilDecay = null;
+  if (safeIdx > 0 && lastActivityIso) {
+    const anchorMs = Date.parse(lastActivityIso);
+    if (!Number.isNaN(anchorMs)) {
+      const remainingMs = DECAY_MS - (Date.now() - anchorMs);
+      daysUntilDecay = Math.max(0, Math.ceil(remainingMs / (24 * 60 * 60 * 1000)));
+    }
+  }
+
+  return {
+    index: current.index,
+    name: current.name,
+    slug: current.slug,
+    icon: current.icon,
+    min: current.min,
+    recharges: Number(completedRecharges || 0),
+    baseIndex: baseLvl.index,
+    baseName: baseLvl.name,
+    nextTarget: nextLvl ? nextLvl.min : null,
+    nextName: nextLvl ? nextLvl.name : null,
+    isPenalized: safeIdx < baseLvl.index,
+    recoveryMinUsd: LEVEL_RECOVERY_MIN_USD,
+    daysUntilDecay
+  };
+}
+
+async function syncUserLevel(env, userRow, notifyDrop = false) {
+  if (!userRow) return null;
+
+  const countRow = await env.DB.prepare(
+    "SELECT COUNT(*) AS count FROM orders WHERE user_id = ? AND status = 'Completado'"
+  ).bind(userRow.id).first();
+  const completedCount = Number(countRow?.count || 0);
+  const baseIndex = getBaseLevelIndex(completedCount);
+
+  let penalty = Math.max(0, Number(userRow.level_penalty || 0));
+  let lastRechargeAt = userRow.last_recharge_at || null;
+  let lastDecayAt = userRow.last_decay_at || null;
+  const prevStoredIndex = Number(userRow.level_index || 0);
+
+  if (!lastRechargeAt && completedCount > 0) {
+    const lastOrd = await env.DB.prepare(
+      "SELECT created_at FROM orders WHERE user_id = ? AND status = 'Completado' ORDER BY created_at DESC LIMIT 1"
+    ).bind(userRow.id).first();
+    if (lastOrd?.created_at) lastRechargeAt = lastOrd.created_at;
+  }
+
+  let changed = false;
+  if (baseIndex === 0) {
+    if (penalty !== 0) {
+      penalty = 0;
+      changed = true;
+    }
+  } else {
+    if (penalty > baseIndex) {
+      penalty = baseIndex;
+      changed = true;
+    }
+
+    const anchorIso = lastDecayAt || lastRechargeAt;
+    if (anchorIso) {
+      const anchorMs = Date.parse(anchorIso);
+      const nowMs = Date.now();
+      if (!Number.isNaN(anchorMs) && nowMs - anchorMs >= DECAY_MS) {
+        const periods = Math.floor((nowMs - anchorMs) / DECAY_MS);
+        const currentEffective = Math.max(0, baseIndex - penalty);
+        if (currentEffective > 0 && periods > 0) {
+          const drop = Math.min(currentEffective, periods);
+          penalty += drop;
+          lastDecayAt = new Date(anchorMs + periods * DECAY_MS).toISOString();
+          changed = true;
+        }
+      }
+    }
+  }
+
+  const effectiveIndex = Math.max(0, baseIndex - penalty);
+  if (effectiveIndex !== prevStoredIndex || lastRechargeAt !== userRow.last_recharge_at || changed) {
+    await env.DB.prepare(
+      "UPDATE users SET level_index = ?, level_penalty = ?, last_recharge_at = ?, last_decay_at = ? WHERE id = ?"
+    ).bind(effectiveIndex, penalty, lastRechargeAt, lastDecayAt, userRow.id).run();
+
+    if (notifyDrop && effectiveIndex < prevStoredIndex) {
+      const newLvl = LEVELS[effectiveIndex];
+      await createAndPushNotification(env, {
+        userId: userRow.id,
+        type: "level",
+        actorName: "ArcanStore",
+        message: `Pasaste ${DECAY_DAYS} días sin recargar y bajaste a nivel ${newLvl.icon} ${newLvl.name}. Completa una recarga de $${LEVEL_RECOVERY_MIN_USD.toFixed(2)} o más para recuperar tu nivel ${LEVELS[baseIndex].name}.`
+      });
+    }
+  }
+
+  return {
+    ...userRow,
+    level_index: effectiveIndex,
+    level_penalty: penalty,
+    last_recharge_at: lastRechargeAt,
+    last_decay_at: lastDecayAt,
+    level: buildLevelPayload(effectiveIndex, baseIndex, completedCount, lastDecayAt || lastRechargeAt)
+  };
+}
+
+async function handleOrderCompletionLevel(env, order, newStatus, prevStatus) {
+  const rawUser = await env.DB.prepare(`
+    SELECT id, name, level_index, level_penalty, last_recharge_at, last_decay_at
+    FROM users WHERE id = ?
+  `).bind(order.user_id).first();
+  if (!rawUser) return;
+
+  const syncedBefore = await syncUserLevel(env, rawUser, false);
+  const prevLevel = syncedBefore.level_index;
+
+  const countRow = await env.DB.prepare(
+    "SELECT COUNT(*) AS count FROM orders WHERE user_id = ? AND status = 'Completado'"
+  ).bind(order.user_id).first();
+  const completedCount = Number(countRow?.count || 0);
+  const baseIndex = getBaseLevelIndex(completedCount);
+
+  let nextPenalty = Number(syncedBefore.level_penalty || 0);
+  let nextLastRecharge = syncedBefore.last_recharge_at;
+  let nextLastDecay = syncedBefore.last_decay_at;
+  let recovered = false;
+
+  if (newStatus === "Completado" && prevStatus !== "Completado") {
+    const nowIso = new Date().toISOString();
+    nextLastRecharge = nowIso;
+    nextLastDecay = null;
+
+    if (nextPenalty > 0 && Number(order.price_usd || 0) >= LEVEL_RECOVERY_MIN_USD) {
+      nextPenalty = 0;
+      recovered = true;
+    }
+  }
+
+  if (nextPenalty > baseIndex) nextPenalty = baseIndex;
+  const nextEffective = Math.max(0, baseIndex - nextPenalty);
+
+  await env.DB.prepare(
+    "UPDATE users SET level_index = ?, level_penalty = ?, last_recharge_at = ?, last_decay_at = ? WHERE id = ?"
+  ).bind(nextEffective, nextPenalty, nextLastRecharge, nextLastDecay, order.user_id).run();
+
+  const levelObj = buildLevelPayload(nextEffective, baseIndex, completedCount, nextLastDecay || nextLastRecharge);
+
+  if (newStatus === "Completado" && prevStatus !== "Completado") {
+    if (recovered && nextEffective > prevLevel) {
+      await createAndPushNotification(env, {
+        userId: order.user_id,
+        type: "level",
+        actorName: "ArcanStore",
+        message: `¡Recarga completada! Recuperaste tu nivel ${levelObj.icon} ${levelObj.name} con tu historial completo (${completedCount} recargas).`
+      });
+    } else if (nextEffective > prevLevel) {
+      await createAndPushNotification(env, {
+        userId: order.user_id,
+        type: "level",
+        actorName: "ArcanStore",
+        message: `¡Subiste a nivel ${levelObj.icon} ${levelObj.name}! Desbloqueaste su insignia y marco exclusivo de perfil.`
+      });
+    } else {
+      await createAndPushNotification(env, {
+        userId: order.user_id,
+        type: "order",
+        actorName: "ArcanStore",
+        message: `Tu recarga ${order.code} (${order.game_name} — ${order.package_name}) fue marcada como Completada.`
+      });
+    }
+  }
+
+  if (nextEffective !== prevLevel || recovered) {
+    await broadcastRealtime(env, {
+      scope: "users",
+      userIds: [order.user_id],
+      event: { type: "level_updated", userId: order.user_id, level: levelObj }
+    });
+  }
+}
+
+/* ================= PROMO / REFERIDOS ================= */
+async function evaluatePromoCode(env, rawCode, originalPriceUsd) {
+  const code = normalizePromoCode(rawCode);
+  if (!code) return { valid: false, error: "Escribe un código válido." };
+
+  const promo = await env.DB.prepare("SELECT * FROM promo_codes WHERE UPPER(code) = ?").bind(code).first();
+  if (!promo || !promo.active) {
+    return { valid: false, error: "El código no existe o no está activo." };
+  }
+
+  if (promo.max_uses !== null && promo.max_uses !== undefined) {
+    const usedRow = await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM orders WHERE UPPER(promo_code) = ? AND status != 'Rechazado'"
+    ).bind(code).first();
+    if (Number(usedRow?.count || 0) >= Number(promo.max_uses)) {
+      return { valid: false, error: "Este código alcanzó su límite máximo de usos." };
+    }
+  }
+
+  const orig = Math.max(0, Number(originalPriceUsd || 0));
+  const val = Math.max(0, Number(promo.discount_value || 0));
+  let discountUsd = 0;
+
+  if (promo.discount_type === "fixed") {
+    discountUsd = Math.min(orig, Number(val.toFixed(2)));
+  } else {
+    const pct = Math.min(100, val);
+    discountUsd = Math.min(orig, Number(((orig * pct) / 100).toFixed(2)));
+  }
+
+  const finalPriceUsd = Math.max(0, Number((orig - discountUsd).toFixed(2)));
+
+  return {
+    valid: true,
+    code: promo.code,
+    discountType: promo.discount_type,
+    discountValue: val,
+    originalPriceUsd: orig,
+    discountUsd,
+    finalPriceUsd
+  };
+}
+
 /* ================= REALTIME WEBSOCKET HUB (DURABLE OBJECT) ================= */
 async function broadcastRealtime(env, payload) {
   if (!env.REALTIME) return;
@@ -252,8 +507,8 @@ async function getStoreData(env) {
   return structuredClone(DEFAULT_STORE);
 }
 
-async function getUserById(env, id) {
-  return await env.DB.prepare(`
+async function getUserById(env, id, includeLevelSync = true) {
+  const row = await env.DB.prepare(`
     SELECT
       id, name, email,
       COALESCE(avatar_url, '') AS avatar_url,
@@ -261,10 +516,18 @@ async function getUserById(env, id) {
       COALESCE(gender, '') AS gender,
       COALESCE(birthday, '') AS birthday,
       age,
+      COALESCE(level_index, 0) AS level_index,
+      COALESCE(level_penalty, 0) AS level_penalty,
+      last_recharge_at,
+      last_decay_at,
       created_at
     FROM users
     WHERE id = ?
   `).bind(id).first();
+
+  if (!row) return null;
+  if (!includeLevelSync) return row;
+  return await syncUserLevel(env, row, true);
 }
 
 async function getNewsReactionsSummary(env, newsId, currentUserId = null) {
@@ -411,7 +674,106 @@ export async function onRequest(context) {
     /* 2. CARGA INICIAL DE LA TIENDA */
     if (method === "GET" && path === "bootstrap") {
       const store = await getStoreData(env);
-      return json(store);
+      return json({ ...store, levels: LEVELS });
+    }
+
+    /* 2.5 IA DE SOPORTE EN VIVO (WORKERS AI) */
+    if (method === "POST" && path === "support/chat") {
+      const body = await request.json().catch(() => ({}));
+      const userMessage = String(body.message || "").trim().slice(0, 600);
+      const history = Array.isArray(body.history) ? body.history.slice(-8) : [];
+
+      if (!userMessage) return json({ error: "Escribe un mensaje para el asistente." }, 400);
+
+      const store = await getStoreData(env);
+      const waPhone = String(store.config.whatsappNumber || "584125891414").replace(/\D/g, "");
+
+      if (!env.AI) {
+        return json({
+          reply: `El asistente IA todavía no está activado en Cloudflare (falta la vinculación AI). Mientras tanto, puedes escribirnos directo por WhatsApp: https://wa.me/${waPhone}`
+        });
+      }
+
+      const bsRate = Number(store.config.bsRate || 1);
+      const activePayments = (store.payments || [])
+        .filter(p => p.active)
+        .map(p => `${p.name} (${p.currency})`)
+        .join(", ");
+
+      const catalogSummary = (store.games || [])
+        .map(g => {
+          const pkgs = (g.packages || [])
+            .map(p => `${p.name}: $${Number(p.priceUsd).toFixed(2)} (${(Number(p.priceUsd) * bsRate).toFixed(2)} Bs)`)
+            .join(" | ");
+          return `- ${g.name} (${g.needsZone ? `pide ${g.idLabel} y ${g.zoneLabel}` : `pide ${g.idLabel}`}): ${pkgs}`;
+        })
+        .join("\n");
+
+      const systemPrompt = [
+        `Eres el asistente virtual oficial de soporte de ${store.config.storeName || "ArcanStore"} (arcanstore.app), una tienda venezolana de recargas gaming.`,
+        `Responde SIEMPRE en español, de forma amable, clara, breve y directa (máximo 4-5 líneas por respuesta salvo que pidan lista de precios).`,
+        `REGLAS Y DATOS ACTUALES DE LA TIENDA:`,
+        `- Tasa del día: 1 USD = ${bsRate.toFixed(2)} Bs.`,
+        `- Métodos de pago activos: ${activePayments || "Pago Móvil, Binance, PayPal, Zinli"}.`,
+        `- Pasos para recargar: 1) Iniciar sesión o registrarse, 2) Elegir juego y colocar ID, 3) Seleccionar paquete, 4) Elegir método de pago (puede aplicar un código de descuento/referido si tiene), subir captura del comprobante y referencia, 5) Enviar los datos a WhatsApp.`,
+        `- Cambio de nombre de perfil: cuesta $${NAME_CHANGE_PRICE_USD.toFixed(2)} USD (o su equivalente en Bs a la tasa del día) desde la pestaña Mi Perfil; cambiar foto, bio, género, cumpleaños y edad es gratis.`,
+        `- Sistema de niveles por recargas completadas: Bronce (0-49), Hierro (50-99), Plata (100-149), Oro (150-199), Esmeralda (200-249), Diamante (250-299), Rubí (300+). Cada nivel otorga insignia y marco exclusivo de perfil.`,
+        `- Inactividad de niveles: si pasas ${DECAY_DAYS} días sin recargar bajas 1 nivel, y lo recuperas completo haciendo una recarga completada de mínimo $${LEVEL_RECOVERY_MIN_USD.toFixed(2)} USD.`,
+        `- WhatsApp oficial de soporte humano: https://wa.me/${waPhone} (útil si el cliente tiene un reclamo de pago, pedido demorado o problema técnico).`,
+        `- CATÁLOGO ACTUAL:\n${catalogSummary}`,
+        `- Nunca inventes precios, códigos de descuento ni prometas reembolsos automáticos. Si el cliente pregunta por el estado específico de un pago o tiene un problema real con una transferencia, indícale amablemente que escriba al WhatsApp oficial.`
+      ].join("\n");
+
+      const messages = [{ role: "system", content: systemPrompt }];
+      for (const h of history) {
+        if (h && (h.role === "user" || h.role === "assistant") && typeof h.content === "string") {
+          messages.push({ role: h.role, content: h.content.slice(0, 500) });
+        }
+      }
+      messages.push({ role: "user", content: userMessage });
+
+      try {
+        const aiRes = await env.AI.run("@cf/meta/llama-3.1-8b-instruct", {
+          messages,
+          max_tokens: 420,
+          temperature: 0.35
+        });
+
+        const reply =
+          aiRes?.response ||
+          aiRes?.choices?.[0]?.message?.content ||
+          `No pude procesar tu consulta ahora mismo. Escríbenos directo por WhatsApp: https://wa.me/${waPhone}`;
+
+        return json({ reply: String(reply).trim() });
+      } catch {
+        return json({
+          reply: `En este momento el asistente está saturado. Por favor contáctanos directo en WhatsApp: https://wa.me/${waPhone}`
+        });
+      }
+    }
+
+    /* 2.6 VALIDAR CÓDIGO DE DESCUENTO / REFERIDO EN CHECKOUT (SIN EXPONER CONTEOS) */
+    if (method === "POST" && path === "promo/validate") {
+      const body = await request.json().catch(() => ({}));
+      const store = await getStoreData(env);
+      const game = store.games.find(g => g.id === body.gameId);
+      const pkg = game?.packages.find(p => p.id === body.packageId);
+
+      const originalPrice = pkg ? Number(pkg.priceUsd) : Number(body.priceUsd || 0);
+      if (originalPrice <= 0) return json({ error: "Selecciona un paquete primero." }, 400);
+
+      const result = await evaluatePromoCode(env, body.code, originalPrice);
+      if (!result.valid) return json({ error: result.error }, 400);
+
+      return json({
+        valid: true,
+        code: result.code,
+        discountType: result.discountType,
+        discountValue: result.discountValue,
+        originalPriceUsd: result.originalPriceUsd,
+        discountUsd: result.discountUsd,
+        finalPriceUsd: result.finalPriceUsd
+      });
     }
 
     /* 3. AUTENTICACIÓN DE USUARIOS */
@@ -429,7 +791,7 @@ export async function onRequest(context) {
       const id = "usr_" + crypto.randomUUID();
       const passwordHash = await hashPassword(password);
       await env.DB.prepare(
-        "INSERT INTO users (id, name, email, password_hash, avatar_url, bio, gender, birthday, age) VALUES (?, ?, ?, ?, '', '', '', '', NULL)"
+        "INSERT INTO users (id, name, email, password_hash, avatar_url, bio, gender, birthday, age, level_index, level_penalty) VALUES (?, ?, ?, ?, '', '', '', '', NULL, 0, 0)"
       ).bind(id, cleanName, cleanEmail, passwordHash).run();
 
       const user = await getUserById(env, id);
@@ -440,32 +802,14 @@ export async function onRequest(context) {
     if (method === "POST" && path === "auth/login") {
       const { email, password } = await request.json();
       const cleanEmail = String(email || "").trim().toLowerCase();
-      const row = await env.DB.prepare(`
-        SELECT id, name, email, password_hash,
-          COALESCE(avatar_url, '') AS avatar_url,
-          COALESCE(bio, '') AS bio,
-          COALESCE(gender, '') AS gender,
-          COALESCE(birthday, '') AS birthday,
-          age, created_at
-        FROM users WHERE email = ?
-      `).bind(cleanEmail).first();
+      const row = await env.DB.prepare("SELECT id, password_hash FROM users WHERE email = ?").bind(cleanEmail).first();
 
       if (!row || !(await verifyPassword(password || "", row.password_hash))) {
         return json({ error: "Correo o contraseña incorrectos." }, 401);
       }
 
-      const user = {
-        id: row.id,
-        name: row.name,
-        email: row.email,
-        avatar_url: row.avatar_url,
-        bio: row.bio,
-        gender: row.gender,
-        birthday: row.birthday,
-        age: row.age,
-        created_at: row.created_at
-      };
-      const token = await signJwt({ sub: row.id, name: row.name, email: row.email, role: "user" }, secret);
+      const user = await getUserById(env, row.id);
+      const token = await signJwt({ sub: user.id, name: user.name, email: user.email, role: "user" }, secret);
       return json({ token, user });
     }
 
@@ -477,7 +821,7 @@ export async function onRequest(context) {
       return json({ user });
     }
 
-    /* 4. PERFILES DE USUARIO (AVATAR, BIO, GÉNERO, CUMPLEAÑOS, EDAD) Y CAMBIO DE NOMBRE ($5 USD) */
+    /* 4. PERFILES DE USUARIO (AVATAR, BIO, GÉNERO, CUMPLEAÑOS, EDAD, NIVEL) Y CAMBIO DE NOMBRE ($5 USD) */
     if (method === "GET" && path === "profile") {
       const payload = await verifyJwt(getBearer(request), secret);
       if (!payload || payload.role !== "user") return json({ error: "Inicia sesión para ver tu perfil." }, 401);
@@ -497,7 +841,7 @@ export async function onRequest(context) {
       if (!payload || payload.role !== "user") return json({ error: "Debes iniciar sesión para editar tu perfil." }, 401);
 
       const body = await request.json();
-      const current = await getUserById(env, payload.sub);
+      const current = await getUserById(env, payload.sub, false);
       if (!current) return json({ error: "Usuario no encontrado." }, 404);
 
       const nextBio = body.bio !== undefined ? String(body.bio).trim().slice(0, 240) : current.bio;
@@ -557,7 +901,7 @@ export async function onRequest(context) {
       const payload = await verifyJwt(getBearer(request), secret);
       if (!payload || payload.role !== "user") return json({ error: "Inicia sesión para solicitar cambio de nombre." }, 401);
 
-      const current = await getUserById(env, payload.sub);
+      const current = await getUserById(env, payload.sub, false);
       if (!current) return json({ error: "Usuario no encontrado." }, 404);
 
       const body = await request.json();
@@ -628,24 +972,44 @@ export async function onRequest(context) {
           COALESCE(bio, '') AS bio,
           COALESCE(gender, '') AS gender,
           COALESCE(birthday, '') AS birthday,
-          age
+          age,
+          COALESCE(level_index, 0) AS level_index
         FROM users ORDER BY name ASC LIMIT 500
       `).all();
       return json({ users: results || [] });
     }
 
     if (method === "GET" && segments[0] === "users" && segments[1] && segments[1] !== "public") {
-      const row = await env.DB.prepare(`
+      const raw = await env.DB.prepare(`
         SELECT id, name,
           COALESCE(avatar_url, '') AS avatar_url,
           COALESCE(bio, '') AS bio,
           COALESCE(gender, '') AS gender,
           COALESCE(birthday, '') AS birthday,
-          age, created_at
+          age,
+          COALESCE(level_index, 0) AS level_index,
+          COALESCE(level_penalty, 0) AS level_penalty,
+          last_recharge_at, last_decay_at,
+          created_at
         FROM users WHERE id = ?
       `).bind(segments[1]).first();
-      if (!row) return json({ error: "Perfil no encontrado." }, 404);
-      return json({ user: row });
+      if (!raw) return json({ error: "Perfil no encontrado." }, 404);
+
+      const synced = await syncUserLevel(env, raw, false);
+      return json({
+        user: {
+          id: synced.id,
+          name: synced.name,
+          avatar_url: synced.avatar_url,
+          bio: synced.bio,
+          gender: synced.gender,
+          birthday: synced.birthday,
+          age: synced.age,
+          level_index: synced.level_index,
+          level: synced.level,
+          created_at: synced.created_at
+        }
+      });
     }
 
     /* 5. NOTIFICACIONES (CAMPANITA EN TIEMPO REAL) */
@@ -788,7 +1152,7 @@ export async function onRequest(context) {
       });
 
       if (added && comment.user_id !== payload.sub) {
-        const actor = await getUserById(env, payload.sub);
+        const actor = await getUserById(env, payload.sub, false);
         const preview = comment.content.slice(0, 48) + (comment.content.length > 48 ? "..." : "");
         await createAndPushNotification(env, {
           userId: comment.user_id,
@@ -834,7 +1198,7 @@ export async function onRequest(context) {
       return json({ ok: true });
     }
 
-    /* Obtener comentarios de una noticia (con sus reacciones) */
+    /* Obtener comentarios de una noticia (con sus reacciones y nivel del autor) */
     if (method === "GET" && segments[0] === "news" && segments[1] && segments[1] !== "comments" && segments[2] === "comments") {
       const newsId = segments[1];
       const payload = await verifyJwt(getBearer(request), secret);
@@ -846,6 +1210,7 @@ export async function onRequest(context) {
           u.name AS user_name,
           COALESCE(u.avatar_url, '') AS user_avatar,
           COALESCE(u.bio, '') AS user_bio,
+          COALESCE(u.level_index, 0) AS user_level_index,
           ru.name AS reply_to_name
         FROM news_comments c
         JOIN users u ON u.id = c.user_id
@@ -966,7 +1331,7 @@ export async function onRequest(context) {
         VALUES (?, ?, ?, ?, ?, ?, ?)
       `).bind(id, newsId, payload.sub, parentId, replyToUserId, content, createdAt).run();
 
-      const author = await getUserById(env, payload.sub);
+      const author = await getUserById(env, payload.sub, false);
       let replyToName = null;
       if (replyToUserId) {
         const target = await env.DB.prepare("SELECT name FROM users WHERE id = ?").bind(replyToUserId).first();
@@ -985,16 +1350,15 @@ export async function onRequest(context) {
         user_name: author?.name || payload.name,
         user_avatar: author?.avatar_url || "",
         user_bio: author?.bio || "",
+        user_level_index: Number(author?.level_index || 0),
         reactions: emptyCommentReactions()
       };
 
-      // Difusión instantánea del comentario a todos los conectados
       await broadcastRealtime(env, {
         scope: "all",
         event: { type: "comment_created", newsId, comment: commentObj }
       });
 
-      // Notificaciones por respuesta y por menciones @usuario
       const notified = new Set([payload.sub]);
       const snippet = content.slice(0, 60) + (content.length > 60 ? "..." : "");
 
@@ -1039,7 +1403,7 @@ export async function onRequest(context) {
       return json({ comment: commentObj }, 201);
     }
 
-    /* 7. SUBIDA DE IMÁGENES A R2 (COMPROBANTES, AVATARES, CATÁLOGO Y NOTICIAS) */
+    /* 7. SUBIDA DE IMÁGENES A R2 */
     if (method === "POST" && path === "upload") {
       const payload = await verifyJwt(getBearer(request), secret);
       if (!payload || (payload.role !== "user" && payload.role !== "admin")) {
@@ -1071,14 +1435,14 @@ export async function onRequest(context) {
       return json({ url: `/api/media/${key}` }, 201);
     }
 
-    /* 8. CREAR PEDIDO DE RECARGA (LOGIN OBLIGATORIO + PRECIO VALIDADO EN SERVIDOR) */
+    /* 8. CREAR PEDIDO DE RECARGA (CON CÓDIGO DE DESCUENTO/REFERIDO OPCIONAL) */
     if (method === "POST" && path === "orders") {
       const payload = await verifyJwt(getBearer(request), secret);
       if (!payload || payload.role !== "user") {
         return json({ error: "Es obligatorio iniciar sesión para poder recargar." }, 401);
       }
 
-      const currentUser = await getUserById(env, payload.sub);
+      const currentUser = await getUserById(env, payload.sub, false);
       const userName = currentUser?.name || payload.name;
       const userEmail = currentUser?.email || payload.email;
 
@@ -1094,6 +1458,7 @@ export async function onRequest(context) {
       const nickname = String(body.nickname || "").trim();
       const reference = String(body.reference || "").trim();
       const receiptUrl = String(body.receiptUrl || "").trim();
+      const rawPromo = String(body.promoCode || "").trim();
 
       if (!game || !pkg || !pay) return json({ error: "Juego, paquete o método de pago inválido." }, 400);
       if (!playerId) return json({ error: "El ID de jugador es obligatorio." }, 400);
@@ -1101,11 +1466,23 @@ export async function onRequest(context) {
       if (!reference) return json({ error: "El código de referencia es obligatorio." }, 400);
       if (!receiptUrl) return json({ error: "Debes adjuntar la captura del comprobante de pago." }, 400);
 
-      const priceUsd = Number(pkg.priceUsd);
-      const bsTotal = priceUsd * Number(store.config.bsRate || 1);
+      const originalPriceUsd = Number(pkg.priceUsd);
+      let appliedCode = "";
+      let discountUsd = 0;
+      let finalPriceUsd = originalPriceUsd;
+
+      if (rawPromo) {
+        const promoEval = await evaluatePromoCode(env, rawPromo, originalPriceUsd);
+        if (!promoEval.valid) return json({ error: promoEval.error }, 400);
+        appliedCode = promoEval.code;
+        discountUsd = promoEval.discountUsd;
+        finalPriceUsd = promoEval.finalPriceUsd;
+      }
+
+      const bsTotal = finalPriceUsd * Number(store.config.bsRate || 1);
       const amountDisplay = pay.currency === "VES"
-        ? `${bsTotal.toFixed(2)} Bs ($${priceUsd.toFixed(2)})`
-        : `$${priceUsd.toFixed(2)}`;
+        ? `${bsTotal.toFixed(2)} Bs ($${finalPriceUsd.toFixed(2)})`
+        : `$${finalPriceUsd.toFixed(2)}`;
 
       const id = "ord_" + crypto.randomUUID();
       const code = "ARC-" + Math.floor(100000 + Math.random() * 900000);
@@ -1115,11 +1492,13 @@ export async function onRequest(context) {
         INSERT INTO orders (
           id, code, user_id, user_name, user_email, game_id, game_name,
           player_id, zone_id, nickname, package_name, price_usd,
+          original_price_usd, discount_usd, promo_code,
           amount_display, payment_name, reference, receipt_url, status, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pendiente', ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pendiente', ?)
       `).bind(
         id, code, payload.sub, userName, userEmail, game.id, game.name,
-        playerId, zoneId, nickname, pkg.name, priceUsd,
+        playerId, zoneId, nickname, pkg.name, finalPriceUsd,
+        originalPriceUsd, discountUsd, appliedCode,
         amountDisplay, pay.name, reference, receiptUrl, createdAt
       ).run();
 
@@ -1127,8 +1506,9 @@ export async function onRequest(context) {
         order: {
           id, code, user_id: payload.sub, user_name: userName, user_email: userEmail,
           game_name: game.name, player_id: playerId, zone_id: zoneId, nickname,
-          package_name: pkg.name, price_usd: priceUsd, amount_display: amountDisplay,
-          payment_name: pay.name, reference, receipt_url: receiptUrl,
+          package_name: pkg.name, price_usd: finalPriceUsd,
+          original_price_usd: originalPriceUsd, discount_usd: discountUsd, promo_code: appliedCode,
+          amount_display: amountDisplay, payment_name: pay.name, reference, receipt_url: receiptUrl,
           status: "Pendiente", created_at: createdAt
         }
       }, 201);
@@ -1198,10 +1578,118 @@ export async function onRequest(context) {
       }
 
       if (method === "PATCH" && segments[0] === "admin" && segments[1] === "orders" && segments[2]) {
+        const orderId = segments[2];
         const { status } = await request.json();
         const allowed = ["Pendiente", "Procesando", "Completado", "Rechazado"];
         if (!allowed.includes(status)) return json({ error: "Estado inválido." }, 400);
-        await env.DB.prepare("UPDATE orders SET status = ? WHERE id = ?").bind(status, segments[2]).run();
+
+        const order = await env.DB.prepare("SELECT * FROM orders WHERE id = ?").bind(orderId).first();
+        if (!order) return json({ error: "Pedido no encontrado." }, 404);
+
+        const prevStatus = order.status;
+        await env.DB.prepare("UPDATE orders SET status = ? WHERE id = ?").bind(status, orderId).run();
+
+        if (status !== prevStatus && (status === "Completado" || prevStatus === "Completado")) {
+          await handleOrderCompletionLevel(env, order, status, prevStatus);
+        }
+
+        return json({ ok: true });
+      }
+
+      /* GESTIÓN DE CÓDIGOS DE DESCUENTO Y REFERIDOS (EXCLUSIVO ADMIN) */
+      if (method === "GET" && path === "admin/promos") {
+        const { results: codes } = await env.DB.prepare(
+          "SELECT * FROM promo_codes ORDER BY created_at DESC"
+        ).all();
+
+        const { results: statsRows } = await env.DB.prepare(`
+          SELECT
+            UPPER(promo_code) AS code,
+            COUNT(CASE WHEN status != 'Rechazado' THEN 1 END) AS total_uses,
+            COUNT(CASE WHEN status = 'Completado' THEN 1 END) AS completed_uses,
+            COUNT(CASE WHEN status IN ('Pendiente', 'Procesando') THEN 1 END) AS pending_uses,
+            COALESCE(SUM(CASE WHEN status = 'Completado' THEN price_usd ELSE 0 END), 0) AS total_sales_usd,
+            COALESCE(SUM(CASE WHEN status = 'Completado' THEN COALESCE(discount_usd, 0) ELSE 0 END), 0) AS total_discount_usd
+          FROM orders
+          WHERE COALESCE(promo_code, '') != ''
+          GROUP BY UPPER(promo_code)
+        `).all();
+
+        const statsMap = new Map((statsRows || []).map(s => [s.code, s]));
+        const promos = (codes || []).map(p => {
+          const st = statsMap.get(String(p.code).toUpperCase()) || {};
+          return {
+            ...p,
+            active: Boolean(p.active),
+            total_uses: Number(st.total_uses || 0),
+            completed_uses: Number(st.completed_uses || 0),
+            pending_uses: Number(st.pending_uses || 0),
+            total_sales_usd: Number(st.total_sales_usd || 0),
+            total_discount_usd: Number(st.total_discount_usd || 0)
+          };
+        });
+
+        return json({ promos });
+      }
+
+      if (method === "POST" && path === "admin/promos") {
+        const body = await request.json();
+        const code = normalizePromoCode(body.code);
+        const ownerName = String(body.owner_name || "").trim().slice(0, 60);
+        const discountType = body.discount_type === "fixed" ? "fixed" : "percent";
+        const discountValue = Math.max(0, Number(body.discount_value || 0));
+        const maxUses = body.max_uses === "" || body.max_uses === null || body.max_uses === undefined
+          ? null
+          : Math.max(1, parseInt(body.max_uses, 10) || 1);
+
+        if (code.length < 2) return json({ error: "El código debe tener al menos 2 letras o números." }, 400);
+        if (discountType === "percent" && discountValue > 100) {
+          return json({ error: "El porcentaje de descuento no puede superar el 100%." }, 400);
+        }
+
+        const exists = await env.DB.prepare("SELECT id FROM promo_codes WHERE UPPER(code) = ?").bind(code).first();
+        if (exists) return json({ error: "Ese código ya existe." }, 409);
+
+        const id = "prm_" + crypto.randomUUID();
+        await env.DB.prepare(`
+          INSERT INTO promo_codes (id, code, owner_name, discount_type, discount_value, max_uses, active)
+          VALUES (?, ?, ?, ?, ?, ?, 1)
+        `).bind(id, code, ownerName, discountType, discountValue, maxUses).run();
+
+        return json({ ok: true, id, code }, 201);
+      }
+
+      if (method === "PATCH" && segments[0] === "admin" && segments[1] === "promos" && segments[2]) {
+        const promoId = segments[2];
+        const body = await request.json();
+        const existing = await env.DB.prepare("SELECT * FROM promo_codes WHERE id = ?").bind(promoId).first();
+        if (!existing) return json({ error: "Código no encontrado." }, 404);
+
+        const active = body.active !== undefined ? (body.active ? 1 : 0) : existing.active;
+        const ownerName = body.owner_name !== undefined ? String(body.owner_name).trim().slice(0, 60) : existing.owner_name;
+        const discountType = body.discount_type !== undefined
+          ? (body.discount_type === "fixed" ? "fixed" : "percent")
+          : existing.discount_type;
+        const discountValue = body.discount_value !== undefined
+          ? Math.max(0, Number(body.discount_value || 0))
+          : existing.discount_value;
+        const maxUses = body.max_uses !== undefined
+          ? (body.max_uses === "" || body.max_uses === null ? null : Math.max(1, parseInt(body.max_uses, 10) || 1))
+          : existing.max_uses;
+
+        if (discountType === "percent" && discountValue > 100) {
+          return json({ error: "El descuento porcentual no puede superar el 100%." }, 400);
+        }
+
+        await env.DB.prepare(
+          "UPDATE promo_codes SET active = ?, owner_name = ?, discount_type = ?, discount_value = ?, max_uses = ? WHERE id = ?"
+        ).bind(active, ownerName, discountType, discountValue, maxUses, promoId).run();
+
+        return json({ ok: true });
+      }
+
+      if (method === "DELETE" && segments[0] === "admin" && segments[1] === "promos" && segments[2]) {
+        await env.DB.prepare("DELETE FROM promo_codes WHERE id = ?").bind(segments[2]).run();
         return json({ ok: true });
       }
 
@@ -1287,7 +1775,6 @@ export async function onRequest(context) {
           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         `).bind(id, title, content, imageUrl, tag, pinned, now, now).run();
 
-        // Notificación masiva en 1 sola consulta para todos los usuarios registrados
         const notifMsg = `Nueva noticia: ${title}`;
         await env.DB.prepare(`
           INSERT INTO notifications (id, user_id, type, actor_name, news_id, message, is_read, created_at)
