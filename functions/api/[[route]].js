@@ -125,6 +125,9 @@ const DEFAULT_STORE = {
   ]
 };
 
+const NAME_CHANGE_PRICE_USD = 5.0;
+const ALLOWED_EMOJIS = ["🔥", "❤️", "🎮", "😮", "👍", "😂"];
+
 /* ================= UTILIDADES CRYPTO & JSON ================= */
 const enc = new TextEncoder();
 
@@ -207,7 +210,7 @@ function getBearer(request) {
   return auth.startsWith("Bearer ") ? auth.slice(7).trim() : null;
 }
 
-/* ================= STORE STATE EN D1 ================= */
+/* ================= HELPERS D1 ================= */
 async function getStoreData(env) {
   const row = await env.DB.prepare("SELECT value FROM store_state WHERE key = 'store_data'").first();
   if (row?.value) return JSON.parse(row.value);
@@ -216,6 +219,36 @@ async function getStoreData(env) {
     .bind(JSON.stringify(DEFAULT_STORE))
     .run();
   return structuredClone(DEFAULT_STORE);
+}
+
+async function getUserById(env, id) {
+  return await env.DB.prepare(
+    "SELECT id, name, email, COALESCE(avatar_url, '') AS avatar_url, COALESCE(bio, '') AS bio, created_at FROM users WHERE id = ?"
+  ).bind(id).first();
+}
+
+async function getNewsReactionsSummary(env, newsId, currentUserId = null) {
+  const { results } = await env.DB.prepare(
+    "SELECT emoji, COUNT(*) AS count FROM news_reactions WHERE news_id = ? GROUP BY emoji"
+  ).bind(newsId).all();
+
+  const mySet = new Set();
+  if (currentUserId) {
+    const { results: mine } = await env.DB.prepare(
+      "SELECT emoji FROM news_reactions WHERE news_id = ? AND user_id = ?"
+    ).bind(newsId, currentUserId).all();
+    for (const r of mine || []) mySet.add(r.emoji);
+  }
+
+  const reactions = {};
+  for (const emoji of ALLOWED_EMOJIS) {
+    const found = (results || []).find(r => r.emoji === emoji);
+    reactions[emoji] = {
+      count: found ? Number(found.count) : 0,
+      reacted: mySet.has(emoji)
+    };
+  }
+  return reactions;
 }
 
 /* ================= HANDLER PRINCIPAL ================= */
@@ -250,8 +283,8 @@ export async function onRequest(context) {
       const { name, email, password } = await request.json();
       const cleanName = String(name || "").trim();
       const cleanEmail = String(email || "").trim().toLowerCase();
-      if (cleanName.length < 2 || !cleanEmail.includes("@") || String(password || "").length < 4) {
-        return json({ error: "Completa los datos correctamente (contraseña mínimo 4 caracteres)." }, 400);
+      if (cleanName.length < 2 || cleanName.length > 32 || !cleanEmail.includes("@") || String(password || "").length < 4) {
+        return json({ error: "Completa los datos correctamente (nombre 2-32 caracteres, contraseña mínimo 4)." }, 400);
       }
 
       const existing = await env.DB.prepare("SELECT id FROM users WHERE email = ?").bind(cleanEmail).first();
@@ -259,11 +292,11 @@ export async function onRequest(context) {
 
       const id = "usr_" + crypto.randomUUID();
       const passwordHash = await hashPassword(password);
-      await env.DB.prepare("INSERT INTO users (id, name, email, password_hash) VALUES (?, ?, ?, ?)")
+      await env.DB.prepare("INSERT INTO users (id, name, email, password_hash, avatar_url, bio) VALUES (?, ?, ?, ?, '', '')")
         .bind(id, cleanName, cleanEmail, passwordHash)
         .run();
 
-      const user = { id, name: cleanName, email: cleanEmail };
+      const user = { id, name: cleanName, email: cleanEmail, avatar_url: "", bio: "" };
       const token = await signJwt({ sub: id, name: cleanName, email: cleanEmail, role: "user" }, secret);
       return json({ token, user }, 201);
     }
@@ -271,15 +304,15 @@ export async function onRequest(context) {
     if (method === "POST" && path === "auth/login") {
       const { email, password } = await request.json();
       const cleanEmail = String(email || "").trim().toLowerCase();
-      const row = await env.DB.prepare("SELECT id, name, email, password_hash FROM users WHERE email = ?")
-        .bind(cleanEmail)
-        .first();
+      const row = await env.DB.prepare(
+        "SELECT id, name, email, password_hash, COALESCE(avatar_url, '') AS avatar_url, COALESCE(bio, '') AS bio FROM users WHERE email = ?"
+      ).bind(cleanEmail).first();
 
       if (!row || !(await verifyPassword(password || "", row.password_hash))) {
         return json({ error: "Correo o contraseña incorrectos." }, 401);
       }
 
-      const user = { id: row.id, name: row.name, email: row.email };
+      const user = { id: row.id, name: row.name, email: row.email, avatar_url: row.avatar_url, bio: row.bio };
       const token = await signJwt({ sub: row.id, name: row.name, email: row.email, role: "user" }, secret);
       return json({ token, user });
     }
@@ -287,19 +320,332 @@ export async function onRequest(context) {
     if (method === "GET" && path === "auth/me") {
       const payload = await verifyJwt(getBearer(request), secret);
       if (!payload || payload.role !== "user") return json({ error: "No autenticado." }, 401);
-      return json({ user: { id: payload.sub, name: payload.name, email: payload.email } });
+      const user = await getUserById(env, payload.sub);
+      if (!user) return json({ error: "Usuario no encontrado." }, 401);
+      return json({ user });
     }
 
-    /* 4. SUBIDA DE COMPROBANTE DE PAGO A R2 (REQUIERE LOGIN DE USUARIO) */
+    /* 4. PERFILES DE USUARIO Y CAMBIO DE NOMBRE ($5 USD) */
+    if (method === "GET" && path === "profile") {
+      const payload = await verifyJwt(getBearer(request), secret);
+      if (!payload || payload.role !== "user") return json({ error: "Inicia sesión para ver tu perfil." }, 401);
+
+      const user = await getUserById(env, payload.sub);
+      if (!user) return json({ error: "Usuario no encontrado." }, 404);
+
+      const { results: requests } = await env.DB.prepare(
+        "SELECT * FROM name_change_requests WHERE user_id = ? ORDER BY created_at DESC LIMIT 20"
+      ).bind(payload.sub).all();
+
+      return json({ user, nameChangePriceUsd: NAME_CHANGE_PRICE_USD, requests: requests || [] });
+    }
+
+    if (method === "PATCH" && path === "profile") {
+      const payload = await verifyJwt(getBearer(request), secret);
+      if (!payload || payload.role !== "user") return json({ error: "Debes iniciar sesión para editar tu perfil." }, 401);
+
+      const body = await request.json();
+      const current = await getUserById(env, payload.sub);
+      if (!current) return json({ error: "Usuario no encontrado." }, 404);
+
+      const nextBio = body.bio !== undefined ? String(body.bio).trim().slice(0, 240) : current.bio;
+      let nextAvatar = current.avatar_url;
+
+      if (body.avatar_url !== undefined) {
+        const rawAvatar = String(body.avatar_url || "").trim();
+        if (rawAvatar && !rawAvatar.startsWith("/api/media/avatars/")) {
+          return json({ error: "URL de foto de perfil inválida." }, 400);
+        }
+        nextAvatar = rawAvatar;
+      }
+
+      await env.DB.prepare("UPDATE users SET avatar_url = ?, bio = ? WHERE id = ?")
+        .bind(nextAvatar, nextBio, payload.sub)
+        .run();
+
+      const updated = await getUserById(env, payload.sub);
+      return json({ user: updated });
+    }
+
+    if (method === "POST" && path === "profile/name-change") {
+      const payload = await verifyJwt(getBearer(request), secret);
+      if (!payload || payload.role !== "user") return json({ error: "Inicia sesión para solicitar cambio de nombre." }, 401);
+
+      const current = await getUserById(env, payload.sub);
+      if (!current) return json({ error: "Usuario no encontrado." }, 404);
+
+      const body = await request.json();
+      const newName = String(body.newName || "").trim();
+      const reference = String(body.reference || "").trim();
+      const receiptUrl = String(body.receiptUrl || "").trim();
+
+      if (newName.length < 2 || newName.length > 32) {
+        return json({ error: "El nuevo nombre debe tener entre 2 y 32 caracteres." }, 400);
+      }
+      if (newName.toLowerCase() === current.name.toLowerCase()) {
+        return json({ error: "El nuevo nombre debe ser diferente al actual." }, 400);
+      }
+
+      const nameTaken = await env.DB.prepare(
+        "SELECT id FROM users WHERE LOWER(name) = LOWER(?) AND id != ?"
+      ).bind(newName, payload.sub).first();
+      if (nameTaken) {
+        return json({ error: "Ese nombre ya está en uso por otro usuario." }, 409);
+      }
+
+      const pending = await env.DB.prepare(
+        "SELECT id FROM name_change_requests WHERE user_id = ? AND status = 'Pendiente'"
+      ).bind(payload.sub).first();
+      if (pending) {
+        return json({ error: "Ya tienes una solicitud de cambio de nombre pendiente de aprobación." }, 409);
+      }
+
+      const store = await getStoreData(env);
+      const pay = store.payments.find(p => p.id === body.paymentId && p.active);
+      if (!pay) return json({ error: "Método de pago inválido." }, 400);
+      if (!reference) return json({ error: "El código de referencia es obligatorio." }, 400);
+      if (!receiptUrl) return json({ error: "Debes adjuntar el comprobante de pago." }, 400);
+
+      const priceUsd = NAME_CHANGE_PRICE_USD;
+      const bsTotal = priceUsd * Number(store.config.bsRate || 1);
+      const amountDisplay = pay.currency === "VES"
+        ? `${bsTotal.toFixed(2)} Bs ($${priceUsd.toFixed(2)})`
+        : `$${priceUsd.toFixed(2)}`;
+
+      const id = "ncr_" + crypto.randomUUID();
+      const createdAt = new Date().toISOString();
+
+      await env.DB.prepare(`
+        INSERT INTO name_change_requests (
+          id, user_id, old_name, new_name, price_usd, amount_display,
+          payment_name, reference, receipt_url, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pendiente', ?)
+      `).bind(
+        id, payload.sub, current.name, newName, priceUsd, amountDisplay,
+        pay.name, reference, receiptUrl, createdAt
+      ).run();
+
+      return json({
+        request: {
+          id, user_id: payload.sub, old_name: current.name, new_name: newName,
+          price_usd: priceUsd, amount_display: amountDisplay, payment_name: pay.name,
+          reference, receipt_url: receiptUrl, status: "Pendiente", created_at: createdAt
+        }
+      }, 201);
+    }
+
+    /* Directorio público ligero para etiquetas @usuario y ver perfiles */
+    if (method === "GET" && path === "users/public") {
+      const { results } = await env.DB.prepare(
+        "SELECT id, name, COALESCE(avatar_url, '') AS avatar_url, COALESCE(bio, '') AS bio FROM users ORDER BY name ASC LIMIT 500"
+      ).all();
+      return json({ users: results || [] });
+    }
+
+    if (method === "GET" && segments[0] === "users" && segments[1] && segments[1] !== "public") {
+      const row = await env.DB.prepare(
+        "SELECT id, name, COALESCE(avatar_url, '') AS avatar_url, COALESCE(bio, '') AS bio, created_at FROM users WHERE id = ?"
+      ).bind(segments[1]).first();
+      if (!row) return json({ error: "Perfil no encontrado." }, 404);
+      return json({ user: row });
+    }
+
+    /* 5. NOTICIAS PÚBLICAS, REACCIONES Y COMENTARIOS CON MENCIONES */
+    if (method === "GET" && path === "news") {
+      const payload = await verifyJwt(getBearer(request), secret);
+      const currentUserId = payload?.role === "user" ? payload.sub : null;
+
+      const { results: newsRows } = await env.DB.prepare(
+        "SELECT * FROM news ORDER BY pinned DESC, created_at DESC LIMIT 50"
+      ).all();
+
+      const { results: reactionRows } = await env.DB.prepare(
+        "SELECT news_id, emoji, COUNT(*) AS count FROM news_reactions GROUP BY news_id, emoji"
+      ).all();
+
+      const { results: commentCounts } = await env.DB.prepare(
+        "SELECT news_id, COUNT(*) AS count FROM news_comments GROUP BY news_id"
+      ).all();
+
+      const myMap = new Map();
+      if (currentUserId) {
+        const { results: mine } = await env.DB.prepare(
+          "SELECT news_id, emoji FROM news_reactions WHERE user_id = ?"
+        ).bind(currentUserId).all();
+        for (const r of mine || []) {
+          if (!myMap.has(r.news_id)) myMap.set(r.news_id, new Set());
+          myMap.get(r.news_id).add(r.emoji);
+        }
+      }
+
+      const commentMap = new Map((commentCounts || []).map(c => [c.news_id, Number(c.count)]));
+      const news = (newsRows || []).map(item => {
+        const reactions = {};
+        const mySet = myMap.get(item.id) || new Set();
+        for (const emoji of ALLOWED_EMOJIS) {
+          const found = (reactionRows || []).find(r => r.news_id === item.id && r.emoji === emoji);
+          reactions[emoji] = {
+            count: found ? Number(found.count) : 0,
+            reacted: mySet.has(emoji)
+          };
+        }
+        return {
+          ...item,
+          pinned: Boolean(item.pinned),
+          reactions,
+          comments_count: commentMap.get(item.id) || 0
+        };
+      });
+
+      return json({ news, emojis: ALLOWED_EMOJIS });
+    }
+
+    if (method === "GET" && segments[0] === "news" && segments[1] && segments[2] === "comments") {
+      const newsId = segments[1];
+      const { results } = await env.DB.prepare(`
+        SELECT
+          c.id, c.news_id, c.user_id, c.parent_id, c.reply_to_user_id, c.content, c.created_at,
+          u.name AS user_name,
+          COALESCE(u.avatar_url, '') AS user_avatar,
+          COALESCE(u.bio, '') AS user_bio,
+          ru.name AS reply_to_name
+        FROM news_comments c
+        JOIN users u ON u.id = c.user_id
+        LEFT JOIN users ru ON ru.id = c.reply_to_user_id
+        WHERE c.news_id = ?
+        ORDER BY c.created_at ASC
+        LIMIT 300
+      `).bind(newsId).all();
+
+      return json({ comments: results || [] });
+    }
+
+    if (method === "POST" && segments[0] === "news" && segments[1] && segments[2] === "react") {
+      const payload = await verifyJwt(getBearer(request), secret);
+      if (!payload || payload.role !== "user") {
+        return json({ error: "Inicia sesión para reaccionar a las noticias." }, 401);
+      }
+
+      const newsId = segments[1];
+      const { emoji } = await request.json();
+      if (!ALLOWED_EMOJIS.includes(emoji)) return json({ error: "Reacción no válida." }, 400);
+
+      const existsNews = await env.DB.prepare("SELECT id FROM news WHERE id = ?").bind(newsId).first();
+      if (!existsNews) return json({ error: "Noticia no encontrada." }, 404);
+
+      const existing = await env.DB.prepare(
+        "SELECT id FROM news_reactions WHERE news_id = ? AND user_id = ? AND emoji = ?"
+      ).bind(newsId, payload.sub, emoji).first();
+
+      if (existing) {
+        await env.DB.prepare("DELETE FROM news_reactions WHERE id = ?").bind(existing.id).run();
+      } else {
+        await env.DB.prepare(
+          "INSERT INTO news_reactions (id, news_id, user_id, emoji) VALUES (?, ?, ?, ?)"
+        ).bind("nrx_" + crypto.randomUUID(), newsId, payload.sub, emoji).run();
+      }
+
+      const reactions = await getNewsReactionsSummary(env, newsId, payload.sub);
+      return json({ reactions });
+    }
+
+    if (method === "POST" && segments[0] === "news" && segments[1] && segments[2] === "comments") {
+      const payload = await verifyJwt(getBearer(request), secret);
+      if (!payload || payload.role !== "user") {
+        return json({ error: "Inicia sesión para comentar." }, 401);
+      }
+
+      const newsId = segments[1];
+      const existsNews = await env.DB.prepare("SELECT id FROM news WHERE id = ?").bind(newsId).first();
+      if (!existsNews) return json({ error: "Noticia no encontrada." }, 404);
+
+      const body = await request.json();
+      const content = String(body.content || "").trim();
+      if (content.length < 1 || content.length > 600) {
+        return json({ error: "El comentario debe tener entre 1 y 600 caracteres." }, 400);
+      }
+
+      let parentId = body.parentId ? String(body.parentId).trim() : null;
+      let replyToUserId = body.replyToUserId ? String(body.replyToUserId).trim() : null;
+
+      if (parentId) {
+        const parent = await env.DB.prepare(
+          "SELECT id, parent_id, user_id FROM news_comments WHERE id = ? AND news_id = ?"
+        ).bind(parentId, newsId).first();
+        if (!parent) return json({ error: "El comentario al que respondes no existe." }, 404);
+        // Mantiene 2 niveles limpios agrupando respuestas bajo el comentario raíz
+        parentId = parent.parent_id || parent.id;
+        if (!replyToUserId) replyToUserId = parent.user_id;
+      }
+
+      const id = "ncm_" + crypto.randomUUID();
+      const createdAt = new Date().toISOString();
+
+      await env.DB.prepare(`
+        INSERT INTO news_comments (id, news_id, user_id, parent_id, reply_to_user_id, content, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).bind(id, newsId, payload.sub, parentId, replyToUserId, content, createdAt).run();
+
+      const author = await getUserById(env, payload.sub);
+      let replyToName = null;
+      if (replyToUserId) {
+        const target = await env.DB.prepare("SELECT name FROM users WHERE id = ?").bind(replyToUserId).first();
+        replyToName = target?.name || null;
+      }
+
+      return json({
+        comment: {
+          id,
+          news_id: newsId,
+          user_id: payload.sub,
+          parent_id: parentId,
+          reply_to_user_id: replyToUserId,
+          reply_to_name: replyToName,
+          content,
+          created_at: createdAt,
+          user_name: author?.name || payload.name,
+          user_avatar: author?.avatar_url || "",
+          user_bio: author?.bio || ""
+        }
+      }, 201);
+    }
+
+    if (method === "DELETE" && segments[0] === "news" && segments[1] === "comments" && segments[2]) {
+      const payload = await verifyJwt(getBearer(request), secret);
+      if (!payload || (payload.role !== "user" && payload.role !== "admin")) {
+        return json({ error: "No autorizado." }, 401);
+      }
+
+      const commentId = segments[2];
+      const comment = await env.DB.prepare("SELECT id, user_id FROM news_comments WHERE id = ?").bind(commentId).first();
+      if (!comment) return json({ error: "Comentario no encontrado." }, 404);
+
+      if (payload.role !== "admin" && comment.user_id !== payload.sub) {
+        return json({ error: "Solo puedes eliminar tus propios comentarios." }, 403);
+      }
+
+      await env.DB.prepare("DELETE FROM news_comments WHERE parent_id = ?").bind(commentId).run();
+      await env.DB.prepare("DELETE FROM news_comments WHERE id = ?").bind(commentId).run();
+      return json({ ok: true });
+    }
+
+    /* 6. SUBIDA DE IMÁGENES A R2 (COMPROBANTES, AVATARES, CATÁLOGO Y NOTICIAS) */
     if (method === "POST" && path === "upload") {
       const payload = await verifyJwt(getBearer(request), secret);
       if (!payload || (payload.role !== "user" && payload.role !== "admin")) {
-        return json({ error: "Debes iniciar sesión para subir comprobantes." }, 401);
+        return json({ error: "Debes iniciar sesión para subir imágenes." }, 401);
       }
 
       const form = await request.formData();
       const file = form.get("file");
-      const folder = payload.role === "admin" && form.get("folder") === "catalog" ? "catalog" : "receipts";
+      const reqFolder = String(form.get("folder") || "receipts");
+
+      let folder = "receipts";
+      if (payload.role === "admin" && ["catalog", "news", "receipts"].includes(reqFolder)) {
+        folder = reqFolder;
+      } else if (payload.role === "user" && ["avatars", "receipts"].includes(reqFolder)) {
+        folder = reqFolder;
+      }
 
       if (!file || typeof file === "string") return json({ error: "Archivo inválido." }, 400);
       if (!file.type.startsWith("image/")) return json({ error: "Solo se permiten imágenes." }, 400);
@@ -315,12 +661,16 @@ export async function onRequest(context) {
       return json({ url: `/api/media/${key}` }, 201);
     }
 
-    /* 5. CREAR PEDIDO DE RECARGA (LOGIN OBLIGATORIO + PRECIO VALIDADO EN SERVIDOR) */
+    /* 7. CREAR PEDIDO DE RECARGA (LOGIN OBLIGATORIO + PRECIO VALIDADO EN SERVIDOR) */
     if (method === "POST" && path === "orders") {
       const payload = await verifyJwt(getBearer(request), secret);
       if (!payload || payload.role !== "user") {
         return json({ error: "Es obligatorio iniciar sesión para poder recargar." }, 401);
       }
+
+      const currentUser = await getUserById(env, payload.sub);
+      const userName = currentUser?.name || payload.name;
+      const userEmail = currentUser?.email || payload.email;
 
       const body = await request.json();
       const store = await getStoreData(env);
@@ -358,14 +708,14 @@ export async function onRequest(context) {
           amount_display, payment_name, reference, receipt_url, status, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pendiente', ?)
       `).bind(
-        id, code, payload.sub, payload.name, payload.email, game.id, game.name,
+        id, code, payload.sub, userName, userEmail, game.id, game.name,
         playerId, zoneId, nickname, pkg.name, priceUsd,
         amountDisplay, pay.name, reference, receiptUrl, createdAt
       ).run();
 
       return json({
         order: {
-          id, code, user_id: payload.sub, user_name: payload.name, user_email: payload.email,
+          id, code, user_id: payload.sub, user_name: userName, user_email: userEmail,
           game_name: game.name, player_id: playerId, zone_id: zoneId, nickname,
           package_name: pkg.name, price_usd: priceUsd, amount_display: amountDisplay,
           payment_name: pay.name, reference, receipt_url: receiptUrl,
@@ -374,7 +724,7 @@ export async function onRequest(context) {
       }, 201);
     }
 
-    /* 6. HISTORIAL DEL USUARIO AUTENTICADO */
+    /* 8. HISTORIAL DEL USUARIO AUTENTICADO */
     if (method === "GET" && path === "orders/mine") {
       const payload = await verifyJwt(getBearer(request), secret);
       if (!payload || payload.role !== "user") return json({ error: "Inicia sesión para ver tu historial." }, 401);
@@ -386,7 +736,7 @@ export async function onRequest(context) {
       return json({ orders: results || [] });
     }
 
-    /* 7. LOGIN DE ADMINISTRADOR */
+    /* 9. LOGIN DE ADMINISTRADOR */
     if (method === "POST" && path === "admin/login") {
       const { password } = await request.json();
       const storedHash = await env.DB.prepare("SELECT value FROM store_state WHERE key = 'admin_pass_hash'").first();
@@ -405,7 +755,7 @@ export async function onRequest(context) {
       return json({ adminToken });
     }
 
-    /* 8. RUTAS PROTEGIDAS DE ADMINISTRADOR */
+    /* 10. RUTAS PROTEGIDAS DE ADMINISTRADOR */
     if (path.startsWith("admin/")) {
       const adminPayload = await verifyJwt(getBearer(request), secret);
       if (!adminPayload || adminPayload.role !== "admin") {
@@ -442,6 +792,111 @@ export async function onRequest(context) {
         const allowed = ["Pendiente", "Procesando", "Completado", "Rechazado"];
         if (!allowed.includes(status)) return json({ error: "Estado inválido." }, 400);
         await env.DB.prepare("UPDATE orders SET status = ? WHERE id = ?").bind(status, segments[2]).run();
+        return json({ ok: true });
+      }
+
+      /* Gestión de solicitudes de cambio de nombre ($5 USD) */
+      if (method === "GET" && path === "admin/name-changes") {
+        const { results } = await env.DB.prepare(`
+          SELECT r.*, u.email AS user_email, COALESCE(u.avatar_url, '') AS user_avatar
+          FROM name_change_requests r
+          LEFT JOIN users u ON u.id = r.user_id
+          ORDER BY CASE WHEN r.status = 'Pendiente' THEN 0 ELSE 1 END, r.created_at DESC
+          LIMIT 200
+        `).all();
+        return json({ requests: results || [] });
+      }
+
+      if (method === "PATCH" && segments[0] === "admin" && segments[1] === "name-changes" && segments[2]) {
+        const reqId = segments[2];
+        const { status } = await request.json();
+        if (!["Aprobado", "Rechazado"].includes(status)) {
+          return json({ error: "Estado inválido (usa Aprobado o Rechazado)." }, 400);
+        }
+
+        const reqRow = await env.DB.prepare("SELECT * FROM name_change_requests WHERE id = ?").bind(reqId).first();
+        if (!reqRow) return json({ error: "Solicitud no encontrada." }, 404);
+
+        if (status === "Aprobado" && reqRow.status !== "Aprobado") {
+          const taken = await env.DB.prepare(
+            "SELECT id FROM users WHERE LOWER(name) = LOWER(?) AND id != ?"
+          ).bind(reqRow.new_name, reqRow.user_id).first();
+          if (taken) {
+            return json({ error: "Otro usuario ya tomó ese nombre." }, 409);
+          }
+
+          await env.DB.prepare("UPDATE users SET name = ? WHERE id = ?")
+            .bind(reqRow.new_name, reqRow.user_id).run();
+          await env.DB.prepare("UPDATE orders SET user_name = ? WHERE user_id = ?")
+            .bind(reqRow.new_name, reqRow.user_id).run();
+        }
+
+        await env.DB.prepare("UPDATE name_change_requests SET status = ? WHERE id = ?")
+          .bind(status, reqId).run();
+
+        return json({ ok: true });
+      }
+
+      /* Gestión exclusiva de Noticias / Anuncios desde Admin */
+      if (method === "POST" && path === "admin/news") {
+        const body = await request.json();
+        const title = String(body.title || "").trim();
+        const content = String(body.content || "").trim();
+        const imageUrl = String(body.image_url || "").trim();
+        const tag = String(body.tag || "Anuncio").trim().slice(0, 24);
+        const pinned = body.pinned ? 1 : 0;
+
+        if (title.length < 2 || content.length < 2) {
+          return json({ error: "El título y el contenido son obligatorios." }, 400);
+        }
+
+        const id = "nws_" + crypto.randomUUID();
+        const now = new Date().toISOString();
+
+        await env.DB.prepare(`
+          INSERT INTO news (id, title, content, image_url, tag, pinned, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).bind(id, title, content, imageUrl, tag, pinned, now, now).run();
+
+        return json({
+          news: { id, title, content, image_url: imageUrl, tag, pinned: Boolean(pinned), created_at: now, updated_at: now }
+        }, 201);
+      }
+
+      if (method === "PUT" && segments[0] === "admin" && segments[1] === "news" && segments[2]) {
+        const newsId = segments[2];
+        const body = await request.json();
+        const title = String(body.title || "").trim();
+        const content = String(body.content || "").trim();
+        const imageUrl = String(body.image_url || "").trim();
+        const tag = String(body.tag || "Anuncio").trim().slice(0, 24);
+        const pinned = body.pinned ? 1 : 0;
+
+        if (title.length < 2 || content.length < 2) {
+          return json({ error: "El título y el contenido son obligatorios." }, 400);
+        }
+
+        await env.DB.prepare(`
+          UPDATE news
+          SET title = ?, content = ?, image_url = ?, tag = ?, pinned = ?, updated_at = CURRENT_TIMESTAMP
+          WHERE id = ?
+        `).bind(title, content, imageUrl, tag, pinned, newsId).run();
+
+        return json({ ok: true });
+      }
+
+      if (method === "DELETE" && segments[0] === "admin" && segments[1] === "news" && segments[2]) {
+        const newsId = segments[2];
+        await env.DB.prepare("DELETE FROM news_comments WHERE news_id = ?").bind(newsId).run();
+        await env.DB.prepare("DELETE FROM news_reactions WHERE news_id = ?").bind(newsId).run();
+        await env.DB.prepare("DELETE FROM news WHERE id = ?").bind(newsId).run();
+        return json({ ok: true });
+      }
+
+      if (method === "DELETE" && segments[0] === "admin" && segments[1] === "comments" && segments[2]) {
+        const commentId = segments[2];
+        await env.DB.prepare("DELETE FROM news_comments WHERE parent_id = ?").bind(commentId).run();
+        await env.DB.prepare("DELETE FROM news_comments WHERE id = ?").bind(commentId).run();
         return json({ ok: true });
       }
     }
