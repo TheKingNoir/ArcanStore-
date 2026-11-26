@@ -1,38 +1,23 @@
-CREATE TABLE IF NOT EXISTS users (
+ALTER TABLE users ADD COLUMN level_index INTEGER DEFAULT 0;
+ALTER TABLE users ADD COLUMN level_penalty INTEGER DEFAULT 0;
+ALTER TABLE users ADD COLUMN last_recharge_at TEXT DEFAULT NULL;
+ALTER TABLE users ADD COLUMN last_decay_at TEXT DEFAULT NULL;
+
+ALTER TABLE orders ADD COLUMN promo_code TEXT DEFAULT '';
+ALTER TABLE orders ADD COLUMN original_price_usd REAL DEFAULT NULL;
+ALTER TABLE orders ADD COLUMN discount_usd REAL DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS promo_codes (
   id TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  email TEXT UNIQUE NOT NULL,
-  password_hash TEXT NOT NULL,
+  code TEXT UNIQUE NOT NULL,
+  owner_name TEXT DEFAULT '',
+  discount_type TEXT DEFAULT 'percent',
+  discount_value REAL DEFAULT 0,
+  max_uses INTEGER DEFAULT NULL,
+  active INTEGER DEFAULT 1,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE IF NOT EXISTS store_state (
-  key TEXT PRIMARY KEY,
-  value TEXT NOT NULL,
-  updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS orders (
-  id TEXT PRIMARY KEY,
-  code TEXT UNIQUE NOT NULL,
-  user_id TEXT NOT NULL,
-  user_name TEXT NOT NULL,
-  user_email TEXT NOT NULL,
-  game_id TEXT NOT NULL,
-  game_name TEXT NOT NULL,
-  player_id TEXT NOT NULL,
-  zone_id TEXT DEFAULT '',
-  nickname TEXT DEFAULT '',
-  package_name TEXT NOT NULL,
-  price_usd REAL NOT NULL,
-  amount_display TEXT NOT NULL,
-  payment_name TEXT NOT NULL,
-  reference TEXT NOT NULL,
-  receipt_url TEXT DEFAULT '',
-  status TEXT DEFAULT 'Pendiente',
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (user_id) REFERENCES users(id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_orders_promo ON orders(promo_code);
+CREATE INDEX IF NOT EXISTS idx_orders_user_status ON orders(user_id, status);
+CREATE INDEX IF NOT EXISTS idx_promo_codes_code ON promo_codes(code);
