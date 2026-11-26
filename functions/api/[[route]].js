@@ -127,6 +127,8 @@ const DEFAULT_STORE = {
 
 const NAME_CHANGE_PRICE_USD = 5.0;
 const ALLOWED_EMOJIS = ["🔥", "❤️", "🎮", "😮", "👍", "😂"];
+const COMMENT_EMOJIS = ["❤️", "🔥", "😂", "😮", "👍"];
+const ALLOWED_GENDERS = ["", "Masculino", "Femenino", "No binario", "Prefiero no decir"];
 
 /* ================= UTILIDADES CRYPTO & JSON ================= */
 const enc = new TextEncoder();
@@ -136,6 +138,10 @@ function json(data, status = 200) {
     status,
     headers: { "Content-Type": "application/json; charset=utf-8" }
   });
+}
+
+function escapeRegex(str) {
+  return String(str).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function toBase64Url(bytes) {
@@ -210,6 +216,31 @@ function getBearer(request) {
   return auth.startsWith("Bearer ") ? auth.slice(7).trim() : null;
 }
 
+function calculateAgeFromBirthday(birthday) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(birthday)) return null;
+  const [y, m, d] = birthday.split("-").map(Number);
+  const now = new Date();
+  let age = now.getUTCFullYear() - y;
+  const monthDiff = (now.getUTCMonth() + 1) - m;
+  if (monthDiff < 0 || (monthDiff === 0 && now.getUTCDate() < d)) age--;
+  return age >= 10 && age <= 120 ? age : null;
+}
+
+/* ================= REALTIME WEBSOCKET HUB (DURABLE OBJECT) ================= */
+async function broadcastRealtime(env, payload) {
+  if (!env.REALTIME) return;
+  try {
+    const stub = env.REALTIME.get(env.REALTIME.idFromName("global"));
+    await stub.fetch("https://realtime.internal/broadcast", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+  } catch {
+    // Nunca rompe la petición HTTP si el socket falla
+  }
+}
+
 /* ================= HELPERS D1 ================= */
 async function getStoreData(env) {
   const row = await env.DB.prepare("SELECT value FROM store_state WHERE key = 'store_data'").first();
@@ -222,9 +253,18 @@ async function getStoreData(env) {
 }
 
 async function getUserById(env, id) {
-  return await env.DB.prepare(
-    "SELECT id, name, email, COALESCE(avatar_url, '') AS avatar_url, COALESCE(bio, '') AS bio, created_at FROM users WHERE id = ?"
-  ).bind(id).first();
+  return await env.DB.prepare(`
+    SELECT
+      id, name, email,
+      COALESCE(avatar_url, '') AS avatar_url,
+      COALESCE(bio, '') AS bio,
+      COALESCE(gender, '') AS gender,
+      COALESCE(birthday, '') AS birthday,
+      age,
+      created_at
+    FROM users
+    WHERE id = ?
+  `).bind(id).first();
 }
 
 async function getNewsReactionsSummary(env, newsId, currentUserId = null) {
@@ -241,14 +281,88 @@ async function getNewsReactionsSummary(env, newsId, currentUserId = null) {
   }
 
   const reactions = {};
+  const counts = {};
   for (const emoji of ALLOWED_EMOJIS) {
     const found = (results || []).find(r => r.emoji === emoji);
-    reactions[emoji] = {
-      count: found ? Number(found.count) : 0,
-      reacted: mySet.has(emoji)
-    };
+    const count = found ? Number(found.count) : 0;
+    counts[emoji] = count;
+    reactions[emoji] = { count, reacted: mySet.has(emoji) };
   }
+  return { reactions, counts };
+}
+
+async function getCommentReactionsSummary(env, commentId, currentUserId = null) {
+  const { results } = await env.DB.prepare(
+    "SELECT emoji, COUNT(*) AS count FROM comment_reactions WHERE comment_id = ? GROUP BY emoji"
+  ).bind(commentId).all();
+
+  const mySet = new Set();
+  if (currentUserId) {
+    const { results: mine } = await env.DB.prepare(
+      "SELECT emoji FROM comment_reactions WHERE comment_id = ? AND user_id = ?"
+    ).bind(commentId, currentUserId).all();
+    for (const r of mine || []) mySet.add(r.emoji);
+  }
+
+  const reactions = {};
+  const counts = {};
+  for (const emoji of COMMENT_EMOJIS) {
+    const found = (results || []).find(r => r.emoji === emoji);
+    const count = found ? Number(found.count) : 0;
+    counts[emoji] = count;
+    reactions[emoji] = { count, reacted: mySet.has(emoji) };
+  }
+  return { reactions, counts };
+}
+
+function emptyCommentReactions() {
+  const reactions = {};
+  for (const emoji of COMMENT_EMOJIS) reactions[emoji] = { count: 0, reacted: false };
   return reactions;
+}
+
+async function createAndPushNotification(env, {
+  userId,
+  type,
+  actorId = null,
+  actorName = "",
+  actorAvatar = "",
+  newsId = null,
+  commentId = null,
+  message
+}) {
+  if (!userId) return null;
+  const id = "ntf_" + crypto.randomUUID();
+  const createdAt = new Date().toISOString();
+
+  await env.DB.prepare(`
+    INSERT INTO notifications (
+      id, user_id, type, actor_id, actor_name, actor_avatar,
+      news_id, comment_id, message, is_read, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+  `).bind(id, userId, type, actorId, actorName, actorAvatar, newsId, commentId, message, createdAt).run();
+
+  const notification = {
+    id,
+    user_id: userId,
+    type,
+    actor_id: actorId,
+    actor_name: actorName,
+    actor_avatar: actorAvatar,
+    news_id: newsId,
+    comment_id: commentId,
+    message,
+    is_read: 0,
+    created_at: createdAt
+  };
+
+  await broadcastRealtime(env, {
+    scope: "users",
+    userIds: [userId],
+    event: { type: "notification", notification }
+  });
+
+  return notification;
 }
 
 /* ================= HANDLER PRINCIPAL ================= */
@@ -260,6 +374,28 @@ export async function onRequest(context) {
   const secret = env.JWT_SECRET || "cambia_este_secreto_en_cloudflare_pages";
 
   try {
+    /* 0. TÚNEL WEBSOCKET EN TIEMPO REAL (/api/ws) */
+    if (method === "GET" && path === "ws") {
+      if ((request.headers.get("Upgrade") || "").toLowerCase() !== "websocket") {
+        return json({ error: "Se requiere conexión WebSocket." }, 426);
+      }
+      if (!env.REALTIME) {
+        return json({ error: "Servicio WebSocket no vinculado." }, 503);
+      }
+
+      const url = new URL(request.url);
+      const token = url.searchParams.get("token") || getBearer(request);
+      const payload = token ? await verifyJwt(token, secret) : null;
+      const userId = payload?.role === "user" ? payload.sub : "";
+
+      const headers = new Headers(request.headers);
+      headers.delete("X-User-Id");
+      if (userId) headers.set("X-User-Id", userId);
+
+      const stub = env.REALTIME.get(env.REALTIME.idFromName("global"));
+      return stub.fetch(new Request(request.url, { method: "GET", headers }));
+    }
+
     /* 1. SERVIR IMÁGENES DESDE R2 (/api/media/...) */
     if (method === "GET" && segments[0] === "media") {
       const key = segments.slice(1).join("/");
@@ -292,11 +428,11 @@ export async function onRequest(context) {
 
       const id = "usr_" + crypto.randomUUID();
       const passwordHash = await hashPassword(password);
-      await env.DB.prepare("INSERT INTO users (id, name, email, password_hash, avatar_url, bio) VALUES (?, ?, ?, ?, '', '')")
-        .bind(id, cleanName, cleanEmail, passwordHash)
-        .run();
+      await env.DB.prepare(
+        "INSERT INTO users (id, name, email, password_hash, avatar_url, bio, gender, birthday, age) VALUES (?, ?, ?, ?, '', '', '', '', NULL)"
+      ).bind(id, cleanName, cleanEmail, passwordHash).run();
 
-      const user = { id, name: cleanName, email: cleanEmail, avatar_url: "", bio: "" };
+      const user = await getUserById(env, id);
       const token = await signJwt({ sub: id, name: cleanName, email: cleanEmail, role: "user" }, secret);
       return json({ token, user }, 201);
     }
@@ -304,15 +440,31 @@ export async function onRequest(context) {
     if (method === "POST" && path === "auth/login") {
       const { email, password } = await request.json();
       const cleanEmail = String(email || "").trim().toLowerCase();
-      const row = await env.DB.prepare(
-        "SELECT id, name, email, password_hash, COALESCE(avatar_url, '') AS avatar_url, COALESCE(bio, '') AS bio FROM users WHERE email = ?"
-      ).bind(cleanEmail).first();
+      const row = await env.DB.prepare(`
+        SELECT id, name, email, password_hash,
+          COALESCE(avatar_url, '') AS avatar_url,
+          COALESCE(bio, '') AS bio,
+          COALESCE(gender, '') AS gender,
+          COALESCE(birthday, '') AS birthday,
+          age, created_at
+        FROM users WHERE email = ?
+      `).bind(cleanEmail).first();
 
       if (!row || !(await verifyPassword(password || "", row.password_hash))) {
         return json({ error: "Correo o contraseña incorrectos." }, 401);
       }
 
-      const user = { id: row.id, name: row.name, email: row.email, avatar_url: row.avatar_url, bio: row.bio };
+      const user = {
+        id: row.id,
+        name: row.name,
+        email: row.email,
+        avatar_url: row.avatar_url,
+        bio: row.bio,
+        gender: row.gender,
+        birthday: row.birthday,
+        age: row.age,
+        created_at: row.created_at
+      };
       const token = await signJwt({ sub: row.id, name: row.name, email: row.email, role: "user" }, secret);
       return json({ token, user });
     }
@@ -325,7 +477,7 @@ export async function onRequest(context) {
       return json({ user });
     }
 
-    /* 4. PERFILES DE USUARIO Y CAMBIO DE NOMBRE ($5 USD) */
+    /* 4. PERFILES DE USUARIO (AVATAR, BIO, GÉNERO, CUMPLEAÑOS, EDAD) Y CAMBIO DE NOMBRE ($5 USD) */
     if (method === "GET" && path === "profile") {
       const payload = await verifyJwt(getBearer(request), secret);
       if (!payload || payload.role !== "user") return json({ error: "Inicia sesión para ver tu perfil." }, 401);
@@ -350,6 +502,9 @@ export async function onRequest(context) {
 
       const nextBio = body.bio !== undefined ? String(body.bio).trim().slice(0, 240) : current.bio;
       let nextAvatar = current.avatar_url;
+      let nextGender = current.gender;
+      let nextBirthday = current.birthday;
+      let nextAge = current.age;
 
       if (body.avatar_url !== undefined) {
         const rawAvatar = String(body.avatar_url || "").trim();
@@ -359,9 +514,40 @@ export async function onRequest(context) {
         nextAvatar = rawAvatar;
       }
 
-      await env.DB.prepare("UPDATE users SET avatar_url = ?, bio = ? WHERE id = ?")
-        .bind(nextAvatar, nextBio, payload.sub)
-        .run();
+      if (body.gender !== undefined) {
+        const g = String(body.gender || "").trim();
+        if (!ALLOWED_GENDERS.includes(g)) {
+          return json({ error: "Opción de género no válida." }, 400);
+        }
+        nextGender = g;
+      }
+
+      if (body.birthday !== undefined) {
+        const b = String(body.birthday || "").trim();
+        if (b && !/^\d{4}-\d{2}-\d{2}$/.test(b)) {
+          return json({ error: "Formato de fecha de cumpleaños inválido." }, 400);
+        }
+        nextBirthday = b;
+      }
+
+      if (body.age !== undefined) {
+        if (body.age === null || body.age === "") {
+          nextAge = nextBirthday ? calculateAgeFromBirthday(nextBirthday) : null;
+        } else {
+          const parsedAge = parseInt(body.age, 10);
+          if (Number.isNaN(parsedAge) || parsedAge < 10 || parsedAge > 120) {
+            return json({ error: "La edad debe estar entre 10 y 120 años." }, 400);
+          }
+          nextAge = parsedAge;
+        }
+      } else if (body.birthday !== undefined && nextBirthday) {
+        const autoAge = calculateAgeFromBirthday(nextBirthday);
+        if (autoAge !== null) nextAge = autoAge;
+      }
+
+      await env.DB.prepare(
+        "UPDATE users SET avatar_url = ?, bio = ?, gender = ?, birthday = ?, age = ? WHERE id = ?"
+      ).bind(nextAvatar, nextBio, nextGender, nextBirthday, nextAge, payload.sub).run();
 
       const updated = await getUserById(env, payload.sub);
       return json({ user: updated });
@@ -434,23 +620,82 @@ export async function onRequest(context) {
       }, 201);
     }
 
-    /* Directorio público ligero para etiquetas @usuario y ver perfiles */
+    /* Directorio público para etiquetas @usuario y perfiles públicos */
     if (method === "GET" && path === "users/public") {
-      const { results } = await env.DB.prepare(
-        "SELECT id, name, COALESCE(avatar_url, '') AS avatar_url, COALESCE(bio, '') AS bio FROM users ORDER BY name ASC LIMIT 500"
-      ).all();
+      const { results } = await env.DB.prepare(`
+        SELECT id, name,
+          COALESCE(avatar_url, '') AS avatar_url,
+          COALESCE(bio, '') AS bio,
+          COALESCE(gender, '') AS gender,
+          COALESCE(birthday, '') AS birthday,
+          age
+        FROM users ORDER BY name ASC LIMIT 500
+      `).all();
       return json({ users: results || [] });
     }
 
     if (method === "GET" && segments[0] === "users" && segments[1] && segments[1] !== "public") {
-      const row = await env.DB.prepare(
-        "SELECT id, name, COALESCE(avatar_url, '') AS avatar_url, COALESCE(bio, '') AS bio, created_at FROM users WHERE id = ?"
-      ).bind(segments[1]).first();
+      const row = await env.DB.prepare(`
+        SELECT id, name,
+          COALESCE(avatar_url, '') AS avatar_url,
+          COALESCE(bio, '') AS bio,
+          COALESCE(gender, '') AS gender,
+          COALESCE(birthday, '') AS birthday,
+          age, created_at
+        FROM users WHERE id = ?
+      `).bind(segments[1]).first();
       if (!row) return json({ error: "Perfil no encontrado." }, 404);
       return json({ user: row });
     }
 
-    /* 5. NOTICIAS PÚBLICAS, REACCIONES Y COMENTARIOS CON MENCIONES */
+    /* 5. NOTIFICACIONES (CAMPANITA EN TIEMPO REAL) */
+    if (method === "GET" && path === "notifications") {
+      const payload = await verifyJwt(getBearer(request), secret);
+      if (!payload || payload.role !== "user") return json({ error: "Inicia sesión para ver tus notificaciones." }, 401);
+
+      const { results } = await env.DB.prepare(
+        "SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 40"
+      ).bind(payload.sub).all();
+
+      const unreadRow = await env.DB.prepare(
+        "SELECT COUNT(*) AS count FROM notifications WHERE user_id = ? AND is_read = 0"
+      ).bind(payload.sub).first();
+
+      return json({
+        notifications: results || [],
+        unreadCount: Number(unreadRow?.count || 0)
+      });
+    }
+
+    if (method === "POST" && path === "notifications/read") {
+      const payload = await verifyJwt(getBearer(request), secret);
+      if (!payload || payload.role !== "user") return json({ error: "No autorizado." }, 401);
+
+      const body = await request.json().catch(() => ({}));
+      if (body.id) {
+        await env.DB.prepare("UPDATE notifications SET is_read = 1 WHERE id = ? AND user_id = ?")
+          .bind(String(body.id), payload.sub).run();
+      } else {
+        await env.DB.prepare("UPDATE notifications SET is_read = 1 WHERE user_id = ? AND is_read = 0")
+          .bind(payload.sub).run();
+      }
+
+      const unreadRow = await env.DB.prepare(
+        "SELECT COUNT(*) AS count FROM notifications WHERE user_id = ? AND is_read = 0"
+      ).bind(payload.sub).first();
+
+      return json({ ok: true, unreadCount: Number(unreadRow?.count || 0) });
+    }
+
+    if (method === "DELETE" && path === "notifications") {
+      const payload = await verifyJwt(getBearer(request), secret);
+      if (!payload || payload.role !== "user") return json({ error: "No autorizado." }, 401);
+
+      await env.DB.prepare("DELETE FROM notifications WHERE user_id = ?").bind(payload.sub).run();
+      return json({ ok: true, unreadCount: 0 });
+    }
+
+    /* 6. NOTICIAS PÚBLICAS, REACCIONES Y COMENTARIOS EN TIEMPO REAL */
     if (method === "GET" && path === "news") {
       const payload = await verifyJwt(getBearer(request), secret);
       const currentUserId = payload?.role === "user" ? payload.sub : null;
@@ -497,12 +742,105 @@ export async function onRequest(context) {
         };
       });
 
-      return json({ news, emojis: ALLOWED_EMOJIS });
+      return json({ news, emojis: ALLOWED_EMOJIS, commentEmojis: COMMENT_EMOJIS });
     }
 
-    if (method === "GET" && segments[0] === "news" && segments[1] && segments[2] === "comments") {
+    /* Reaccionar a un comentario específico */
+    if (method === "POST" && segments[0] === "news" && segments[1] === "comments" && segments[2] && segments[3] === "react") {
+      const payload = await verifyJwt(getBearer(request), secret);
+      if (!payload || payload.role !== "user") {
+        return json({ error: "Inicia sesión para reaccionar a los comentarios." }, 401);
+      }
+
+      const commentId = segments[2];
+      const { emoji } = await request.json();
+      if (!COMMENT_EMOJIS.includes(emoji)) return json({ error: "Reacción no válida." }, 400);
+
+      const comment = await env.DB.prepare(
+        "SELECT id, news_id, user_id, content FROM news_comments WHERE id = ?"
+      ).bind(commentId).first();
+      if (!comment) return json({ error: "Comentario no encontrado." }, 404);
+
+      const existing = await env.DB.prepare(
+        "SELECT id FROM comment_reactions WHERE comment_id = ? AND user_id = ? AND emoji = ?"
+      ).bind(commentId, payload.sub, emoji).first();
+
+      let added = false;
+      if (existing) {
+        await env.DB.prepare("DELETE FROM comment_reactions WHERE id = ?").bind(existing.id).run();
+      } else {
+        added = true;
+        await env.DB.prepare(
+          "INSERT INTO comment_reactions (id, comment_id, user_id, emoji) VALUES (?, ?, ?, ?)"
+        ).bind("crx_" + crypto.randomUUID(), commentId, payload.sub, emoji).run();
+      }
+
+      const { reactions, counts } = await getCommentReactionsSummary(env, commentId, payload.sub);
+
+      await broadcastRealtime(env, {
+        scope: "all",
+        event: {
+          type: "comment_reaction",
+          newsId: comment.news_id,
+          commentId,
+          counts
+        }
+      });
+
+      if (added && comment.user_id !== payload.sub) {
+        const actor = await getUserById(env, payload.sub);
+        const preview = comment.content.slice(0, 48) + (comment.content.length > 48 ? "..." : "");
+        await createAndPushNotification(env, {
+          userId: comment.user_id,
+          type: "comment_reaction",
+          actorId: payload.sub,
+          actorName: actor?.name || payload.name,
+          actorAvatar: actor?.avatar_url || "",
+          newsId: comment.news_id,
+          commentId: comment.id,
+          message: `${actor?.name || payload.name} reaccionó ${emoji} a tu comentario: "${preview}"`
+        });
+      }
+
+      return json({ reactions });
+    }
+
+    /* Eliminar comentario propio (o cualquier comentario si es Admin) */
+    if (method === "DELETE" && segments[0] === "news" && segments[1] === "comments" && segments[2]) {
+      const payload = await verifyJwt(getBearer(request), secret);
+      if (!payload || (payload.role !== "user" && payload.role !== "admin")) {
+        return json({ error: "No autorizado." }, 401);
+      }
+
+      const commentId = segments[2];
+      const comment = await env.DB.prepare("SELECT id, news_id, user_id FROM news_comments WHERE id = ?").bind(commentId).first();
+      if (!comment) return json({ error: "Comentario no encontrado." }, 404);
+
+      if (payload.role !== "admin" && comment.user_id !== payload.sub) {
+        return json({ error: "Solo puedes eliminar tus propios comentarios." }, 403);
+      }
+
+      await env.DB.prepare(
+        "DELETE FROM comment_reactions WHERE comment_id = ? OR comment_id IN (SELECT id FROM news_comments WHERE parent_id = ?)"
+      ).bind(commentId, commentId).run();
+      await env.DB.prepare("DELETE FROM news_comments WHERE parent_id = ?").bind(commentId).run();
+      await env.DB.prepare("DELETE FROM news_comments WHERE id = ?").bind(commentId).run();
+
+      await broadcastRealtime(env, {
+        scope: "all",
+        event: { type: "comment_deleted", newsId: comment.news_id, commentId }
+      });
+
+      return json({ ok: true });
+    }
+
+    /* Obtener comentarios de una noticia (con sus reacciones) */
+    if (method === "GET" && segments[0] === "news" && segments[1] && segments[1] !== "comments" && segments[2] === "comments") {
       const newsId = segments[1];
-      const { results } = await env.DB.prepare(`
+      const payload = await verifyJwt(getBearer(request), secret);
+      const currentUserId = payload?.role === "user" ? payload.sub : null;
+
+      const { results: commentRows } = await env.DB.prepare(`
         SELECT
           c.id, c.news_id, c.user_id, c.parent_id, c.reply_to_user_id, c.content, c.created_at,
           u.name AS user_name,
@@ -517,10 +855,46 @@ export async function onRequest(context) {
         LIMIT 300
       `).bind(newsId).all();
 
-      return json({ comments: results || [] });
+      const { results: reactCounts } = await env.DB.prepare(`
+        SELECT cr.comment_id, cr.emoji, COUNT(*) AS count
+        FROM comment_reactions cr
+        JOIN news_comments nc ON nc.id = cr.comment_id
+        WHERE nc.news_id = ?
+        GROUP BY cr.comment_id, cr.emoji
+      `).bind(newsId).all();
+
+      const myMap = new Map();
+      if (currentUserId) {
+        const { results: mine } = await env.DB.prepare(`
+          SELECT cr.comment_id, cr.emoji
+          FROM comment_reactions cr
+          JOIN news_comments nc ON nc.id = cr.comment_id
+          WHERE nc.news_id = ? AND cr.user_id = ?
+        `).bind(newsId, currentUserId).all();
+        for (const r of mine || []) {
+          if (!myMap.has(r.comment_id)) myMap.set(r.comment_id, new Set());
+          myMap.get(r.comment_id).add(r.emoji);
+        }
+      }
+
+      const comments = (commentRows || []).map(c => {
+        const reactions = {};
+        const mySet = myMap.get(c.id) || new Set();
+        for (const emoji of COMMENT_EMOJIS) {
+          const found = (reactCounts || []).find(r => r.comment_id === c.id && r.emoji === emoji);
+          reactions[emoji] = {
+            count: found ? Number(found.count) : 0,
+            reacted: mySet.has(emoji)
+          };
+        }
+        return { ...c, reactions };
+      });
+
+      return json({ comments, commentEmojis: COMMENT_EMOJIS });
     }
 
-    if (method === "POST" && segments[0] === "news" && segments[1] && segments[2] === "react") {
+    /* Reaccionar a una noticia */
+    if (method === "POST" && segments[0] === "news" && segments[1] && segments[1] !== "comments" && segments[2] === "react") {
       const payload = await verifyJwt(getBearer(request), secret);
       if (!payload || payload.role !== "user") {
         return json({ error: "Inicia sesión para reaccionar a las noticias." }, 401);
@@ -545,19 +919,26 @@ export async function onRequest(context) {
         ).bind("nrx_" + crypto.randomUUID(), newsId, payload.sub, emoji).run();
       }
 
-      const reactions = await getNewsReactionsSummary(env, newsId, payload.sub);
+      const { reactions, counts } = await getNewsReactionsSummary(env, newsId, payload.sub);
+
+      await broadcastRealtime(env, {
+        scope: "all",
+        event: { type: "news_reaction", newsId, counts }
+      });
+
       return json({ reactions });
     }
 
-    if (method === "POST" && segments[0] === "news" && segments[1] && segments[2] === "comments") {
+    /* Publicar comentario / respuesta / mención @ */
+    if (method === "POST" && segments[0] === "news" && segments[1] && segments[1] !== "comments" && segments[2] === "comments") {
       const payload = await verifyJwt(getBearer(request), secret);
       if (!payload || payload.role !== "user") {
         return json({ error: "Inicia sesión para comentar." }, 401);
       }
 
       const newsId = segments[1];
-      const existsNews = await env.DB.prepare("SELECT id FROM news WHERE id = ?").bind(newsId).first();
-      if (!existsNews) return json({ error: "Noticia no encontrada." }, 404);
+      const newsRow = await env.DB.prepare("SELECT id, title FROM news WHERE id = ?").bind(newsId).first();
+      if (!newsRow) return json({ error: "Noticia no encontrada." }, 404);
 
       const body = await request.json();
       const content = String(body.content || "").trim();
@@ -573,7 +954,6 @@ export async function onRequest(context) {
           "SELECT id, parent_id, user_id FROM news_comments WHERE id = ? AND news_id = ?"
         ).bind(parentId, newsId).first();
         if (!parent) return json({ error: "El comentario al que respondes no existe." }, 404);
-        // Mantiene 2 niveles limpios agrupando respuestas bajo el comentario raíz
         parentId = parent.parent_id || parent.id;
         if (!replyToUserId) replyToUserId = parent.user_id;
       }
@@ -593,43 +973,73 @@ export async function onRequest(context) {
         replyToName = target?.name || null;
       }
 
-      return json({
-        comment: {
-          id,
-          news_id: newsId,
-          user_id: payload.sub,
-          parent_id: parentId,
-          reply_to_user_id: replyToUserId,
-          reply_to_name: replyToName,
-          content,
-          created_at: createdAt,
-          user_name: author?.name || payload.name,
-          user_avatar: author?.avatar_url || "",
-          user_bio: author?.bio || ""
+      const commentObj = {
+        id,
+        news_id: newsId,
+        user_id: payload.sub,
+        parent_id: parentId,
+        reply_to_user_id: replyToUserId,
+        reply_to_name: replyToName,
+        content,
+        created_at: createdAt,
+        user_name: author?.name || payload.name,
+        user_avatar: author?.avatar_url || "",
+        user_bio: author?.bio || "",
+        reactions: emptyCommentReactions()
+      };
+
+      // Difusión instantánea del comentario a todos los conectados
+      await broadcastRealtime(env, {
+        scope: "all",
+        event: { type: "comment_created", newsId, comment: commentObj }
+      });
+
+      // Notificaciones por respuesta y por menciones @usuario
+      const notified = new Set([payload.sub]);
+      const snippet = content.slice(0, 60) + (content.length > 60 ? "..." : "");
+
+      if (replyToUserId && !notified.has(replyToUserId)) {
+        notified.add(replyToUserId);
+        await createAndPushNotification(env, {
+          userId: replyToUserId,
+          type: "reply",
+          actorId: payload.sub,
+          actorName: commentObj.user_name,
+          actorAvatar: commentObj.user_avatar,
+          newsId,
+          commentId: id,
+          message: `${commentObj.user_name} respondió a tu comentario en "${newsRow.title}": ${snippet}`
+        });
+      }
+
+      if (content.includes("@")) {
+        const { results: allUsers } = await env.DB.prepare("SELECT id, name FROM users LIMIT 500").all();
+        const sortedUsers = (allUsers || [])
+          .filter(u => u.name && !notified.has(u.id))
+          .sort((a, b) => b.name.length - a.name.length);
+
+        for (const u of sortedUsers) {
+          const mentionRegex = new RegExp(`(?:^|[\\s(])@${escapeRegex(u.name)}(?![\\wÁÉÍÓÚáéíóúÑñ])`, "i");
+          if (mentionRegex.test(content)) {
+            notified.add(u.id);
+            await createAndPushNotification(env, {
+              userId: u.id,
+              type: "mention",
+              actorId: payload.sub,
+              actorName: commentObj.user_name,
+              actorAvatar: commentObj.user_avatar,
+              newsId,
+              commentId: id,
+              message: `${commentObj.user_name} te etiquetó en "${newsRow.title}": ${snippet}`
+            });
+          }
         }
-      }, 201);
-    }
-
-    if (method === "DELETE" && segments[0] === "news" && segments[1] === "comments" && segments[2]) {
-      const payload = await verifyJwt(getBearer(request), secret);
-      if (!payload || (payload.role !== "user" && payload.role !== "admin")) {
-        return json({ error: "No autorizado." }, 401);
       }
 
-      const commentId = segments[2];
-      const comment = await env.DB.prepare("SELECT id, user_id FROM news_comments WHERE id = ?").bind(commentId).first();
-      if (!comment) return json({ error: "Comentario no encontrado." }, 404);
-
-      if (payload.role !== "admin" && comment.user_id !== payload.sub) {
-        return json({ error: "Solo puedes eliminar tus propios comentarios." }, 403);
-      }
-
-      await env.DB.prepare("DELETE FROM news_comments WHERE parent_id = ?").bind(commentId).run();
-      await env.DB.prepare("DELETE FROM news_comments WHERE id = ?").bind(commentId).run();
-      return json({ ok: true });
+      return json({ comment: commentObj }, 201);
     }
 
-    /* 6. SUBIDA DE IMÁGENES A R2 (COMPROBANTES, AVATARES, CATÁLOGO Y NOTICIAS) */
+    /* 7. SUBIDA DE IMÁGENES A R2 (COMPROBANTES, AVATARES, CATÁLOGO Y NOTICIAS) */
     if (method === "POST" && path === "upload") {
       const payload = await verifyJwt(getBearer(request), secret);
       if (!payload || (payload.role !== "user" && payload.role !== "admin")) {
@@ -661,7 +1071,7 @@ export async function onRequest(context) {
       return json({ url: `/api/media/${key}` }, 201);
     }
 
-    /* 7. CREAR PEDIDO DE RECARGA (LOGIN OBLIGATORIO + PRECIO VALIDADO EN SERVIDOR) */
+    /* 8. CREAR PEDIDO DE RECARGA (LOGIN OBLIGATORIO + PRECIO VALIDADO EN SERVIDOR) */
     if (method === "POST" && path === "orders") {
       const payload = await verifyJwt(getBearer(request), secret);
       if (!payload || payload.role !== "user") {
@@ -724,7 +1134,7 @@ export async function onRequest(context) {
       }, 201);
     }
 
-    /* 8. HISTORIAL DEL USUARIO AUTENTICADO */
+    /* 9. HISTORIAL DEL USUARIO AUTENTICADO */
     if (method === "GET" && path === "orders/mine") {
       const payload = await verifyJwt(getBearer(request), secret);
       if (!payload || payload.role !== "user") return json({ error: "Inicia sesión para ver tu historial." }, 401);
@@ -736,7 +1146,7 @@ export async function onRequest(context) {
       return json({ orders: results || [] });
     }
 
-    /* 9. LOGIN DE ADMINISTRADOR */
+    /* 10. LOGIN DE ADMINISTRADOR */
     if (method === "POST" && path === "admin/login") {
       const { password } = await request.json();
       const storedHash = await env.DB.prepare("SELECT value FROM store_state WHERE key = 'admin_pass_hash'").first();
@@ -755,7 +1165,7 @@ export async function onRequest(context) {
       return json({ adminToken });
     }
 
-    /* 10. RUTAS PROTEGIDAS DE ADMINISTRADOR */
+    /* 11. RUTAS PROTEGIDAS DE ADMINISTRADOR */
     if (path.startsWith("admin/")) {
       const adminPayload = await verifyJwt(getBearer(request), secret);
       if (!adminPayload || adminPayload.role !== "admin") {
@@ -834,6 +1244,25 @@ export async function onRequest(context) {
         await env.DB.prepare("UPDATE name_change_requests SET status = ? WHERE id = ?")
           .bind(status, reqId).run();
 
+        const msg = status === "Aprobado"
+          ? `¡Tu cambio de nombre a "${reqRow.new_name}" fue aprobado!`
+          : `Tu solicitud de cambio de nombre a "${reqRow.new_name}" fue rechazada. Contáctanos por WhatsApp si necesitas ayuda.`;
+
+        await createAndPushNotification(env, {
+          userId: reqRow.user_id,
+          type: "name_change",
+          actorName: "ArcanStore",
+          message: msg
+        });
+
+        if (status === "Aprobado") {
+          await broadcastRealtime(env, {
+            scope: "users",
+            userIds: [reqRow.user_id],
+            event: { type: "name_changed", userId: reqRow.user_id, newName: reqRow.new_name }
+          });
+        }
+
         return json({ ok: true });
       }
 
@@ -858,9 +1287,29 @@ export async function onRequest(context) {
           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         `).bind(id, title, content, imageUrl, tag, pinned, now, now).run();
 
-        return json({
-          news: { id, title, content, image_url: imageUrl, tag, pinned: Boolean(pinned), created_at: now, updated_at: now }
-        }, 201);
+        // Notificación masiva en 1 sola consulta para todos los usuarios registrados
+        const notifMsg = `Nueva noticia: ${title}`;
+        await env.DB.prepare(`
+          INSERT INTO notifications (id, user_id, type, actor_name, news_id, message, is_read, created_at)
+          SELECT 'ntf_' || lower(hex(randomblob(8))), id, 'news', 'ArcanStore', ?, ?, 0, ?
+          FROM users
+        `).bind(id, notifMsg, now).run();
+
+        const emptyNewsReactions = {};
+        for (const e of ALLOWED_EMOJIS) emptyNewsReactions[e] = { count: 0, reacted: false };
+
+        const newsObj = {
+          id, title, content, image_url: imageUrl, tag,
+          pinned: Boolean(pinned), created_at: now, updated_at: now,
+          reactions: emptyNewsReactions, comments_count: 0
+        };
+
+        await broadcastRealtime(env, {
+          scope: "all",
+          event: { type: "news_created", news: newsObj, message: notifMsg }
+        });
+
+        return json({ news: newsObj }, 201);
       }
 
       if (method === "PUT" && segments[0] === "admin" && segments[1] === "news" && segments[2]) {
@@ -882,21 +1331,47 @@ export async function onRequest(context) {
           WHERE id = ?
         `).bind(title, content, imageUrl, tag, pinned, newsId).run();
 
+        await broadcastRealtime(env, {
+          scope: "all",
+          event: { type: "news_updated", newsId }
+        });
+
         return json({ ok: true });
       }
 
       if (method === "DELETE" && segments[0] === "admin" && segments[1] === "news" && segments[2]) {
         const newsId = segments[2];
+        await env.DB.prepare(
+          "DELETE FROM comment_reactions WHERE comment_id IN (SELECT id FROM news_comments WHERE news_id = ?)"
+        ).bind(newsId).run();
         await env.DB.prepare("DELETE FROM news_comments WHERE news_id = ?").bind(newsId).run();
         await env.DB.prepare("DELETE FROM news_reactions WHERE news_id = ?").bind(newsId).run();
+        await env.DB.prepare("DELETE FROM notifications WHERE news_id = ?").bind(newsId).run();
         await env.DB.prepare("DELETE FROM news WHERE id = ?").bind(newsId).run();
+
+        await broadcastRealtime(env, {
+          scope: "all",
+          event: { type: "news_deleted", newsId }
+        });
+
         return json({ ok: true });
       }
 
       if (method === "DELETE" && segments[0] === "admin" && segments[1] === "comments" && segments[2]) {
         const commentId = segments[2];
+        const comment = await env.DB.prepare("SELECT news_id FROM news_comments WHERE id = ?").bind(commentId).first();
+        await env.DB.prepare(
+          "DELETE FROM comment_reactions WHERE comment_id = ? OR comment_id IN (SELECT id FROM news_comments WHERE parent_id = ?)"
+        ).bind(commentId, commentId).run();
         await env.DB.prepare("DELETE FROM news_comments WHERE parent_id = ?").bind(commentId).run();
         await env.DB.prepare("DELETE FROM news_comments WHERE id = ?").bind(commentId).run();
+
+        if (comment?.news_id) {
+          await broadcastRealtime(env, {
+            scope: "all",
+            event: { type: "comment_deleted", newsId: comment.news_id, commentId }
+          });
+        }
         return json({ ok: true });
       }
     }
