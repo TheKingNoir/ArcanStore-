@@ -26,6 +26,10 @@
         <button class="nav-btn" data-view="news" onclick="App.switchView('news')">Noticias</button>
         <button class="nav-btn" data-view="history" onclick="App.switchView('history')">Mis Recargas</button>
         <button class="nav-btn" data-view="profile" onclick="App.switchView('profile')">Mi Perfil</button>
+        <button class="nav-btn nav-notif hidden" id="btn-notif" onclick="App.openNotificationsModal()" title="Notificaciones" aria-label="Notificaciones">
+          <span>🔔</span>
+          <span id="notif-badge" class="notif-badge hidden">0</span>
+        </button>
         <button class="nav-btn" id="btn-auth" onclick="App.openAuthModal()">Iniciar Sesión</button>
         <button class="nav-btn nav-admin" data-view="admin" onclick="App.requestAdminAccess()">🔒 Admin</button>
       </nav>
@@ -55,12 +59,15 @@
       </div>
     </section>
 
-    <!-- VISTA 2: NOTICIAS Y ANUNCIOS (PÚBLICA PARA TODOS) -->
+    <!-- VISTA 2: NOTICIAS Y ANUNCIOS (PÚBLICA + TIEMPO REAL) -->
     <section id="view-news" class="view">
       <div class="section-header">
         <div>
-          <h2>Noticias y Anuncios</h2>
-          <p class="muted">Novedades oficiales de ArcanStore. Reacciona, comenta y etiqueta a otros jugadores con @.</p>
+          <div class="news-header-title">
+            <h2>Noticias y Anuncios</h2>
+            <span id="ws-status" class="ws-pill ws-connecting">● Conectando...</span>
+          </div>
+          <p class="muted">Novedades oficiales de ArcanStore en tiempo real. Reacciona, comenta y etiqueta a otros jugadores con @.</p>
         </div>
         <button class="btn btn-outline" onclick="App.loadNews(true)">↻ Actualizar</button>
       </div>
@@ -86,7 +93,7 @@
       <div class="section-header">
         <div>
           <h2>Mi Perfil</h2>
-          <p class="muted">Personaliza tu foto y descripción gratis, o solicita un cambio de nombre ($5 USD).</p>
+          <p class="muted">Personaliza tu foto con zoom, bio, género, cumpleaños y edad gratis, o solicita cambio de nombre ($5 USD).</p>
         </div>
         <button class="btn btn-outline" onclick="App.switchView('store')">← Volver a la tienda</button>
       </div>
@@ -145,6 +152,48 @@
     <div class="modal glass checkout-modal">
       <button class="modal-close" onclick="App.closeModal('modal-name-change')">✕</button>
       <div id="name-change-modal-content" class="checkout-body"></div>
+    </div>
+  </div>
+
+  <!-- MODAL: NOTIFICACIONES EN TIEMPO REAL -->
+  <div id="modal-notifications" class="modal-backdrop">
+    <div class="modal glass notif-modal">
+      <button class="modal-close" onclick="App.closeModal('modal-notifications')">✕</button>
+      <div class="notif-modal-header">
+        <h3>🔔 Notificaciones</h3>
+        <div class="row-actions">
+          <button type="button" class="btn btn-outline btn-sm" onclick="App.markAllNotificationsRead()">Marcar leídas</button>
+          <button type="button" class="btn btn-danger btn-sm" onclick="App.clearAllNotifications()">Limpiar</button>
+        </div>
+      </div>
+      <div id="notifications-list" class="notifications-list"></div>
+    </div>
+  </div>
+
+  <!-- MODAL: RECORTADOR DE FOTO DE PERFIL CON ZOOM Y ENCUADRE -->
+  <div id="modal-avatar-crop" class="modal-backdrop">
+    <div class="modal glass small-modal crop-modal">
+      <button class="modal-close" onclick="App.closeAvatarCropper()">✕</button>
+      <h3>Ajustar Foto de Perfil</h3>
+      <p class="muted" style="font-size:0.84rem;margin:4px 0 14px;">Arrastra la imagen para centrarla y ajusta el zoom antes de subirla.</p>
+
+      <div class="crop-stage" id="crop-stage">
+        <canvas id="crop-canvas" width="280" height="280"></canvas>
+        <div class="crop-circle-guide"></div>
+      </div>
+
+      <div class="crop-controls">
+        <div class="crop-zoom-row">
+          <span class="muted" style="font-size:0.82rem;">🔍 Zoom</span>
+          <strong id="crop-zoom-val" style="color:var(--accent);font-size:0.84rem;">1.0x</strong>
+        </div>
+        <input type="range" id="crop-zoom" min="1" max="3" step="0.02" value="1" oninput="App.onCropZoom(this.value)" />
+      </div>
+
+      <div class="checkout-actions" style="margin-top:16px;">
+        <button type="button" class="btn btn-outline" onclick="App.closeAvatarCropper()">Cancelar</button>
+        <button type="button" id="btn-crop-save" class="btn btn-primary" onclick="App.confirmAvatarCrop()">Guardar Foto ✓</button>
+      </div>
     </div>
   </div>
 
