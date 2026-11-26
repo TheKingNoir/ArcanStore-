@@ -23,7 +23,9 @@
 
       <nav class="nav-links">
         <button class="nav-btn active" data-view="store" onclick="App.switchView('store')">Tienda</button>
+        <button class="nav-btn" data-view="news" onclick="App.switchView('news')">Noticias</button>
         <button class="nav-btn" data-view="history" onclick="App.switchView('history')">Mis Recargas</button>
+        <button class="nav-btn" data-view="profile" onclick="App.switchView('profile')">Mi Perfil</button>
         <button class="nav-btn" id="btn-auth" onclick="App.openAuthModal()">Iniciar Sesión</button>
         <button class="nav-btn nav-admin" data-view="admin" onclick="App.requestAdminAccess()">🔒 Admin</button>
       </nav>
@@ -53,7 +55,21 @@
       </div>
     </section>
 
-    <!-- VISTA 2: HISTORIAL DE RECARGAS -->
+    <!-- VISTA 2: NOTICIAS Y ANUNCIOS (PÚBLICA PARA TODOS) -->
+    <section id="view-news" class="view">
+      <div class="section-header">
+        <div>
+          <h2>Noticias y Anuncios</h2>
+          <p class="muted">Novedades oficiales de ArcanStore. Reacciona, comenta y etiqueta a otros jugadores con @.</p>
+        </div>
+        <button class="btn btn-outline" onclick="App.loadNews(true)">↻ Actualizar</button>
+      </div>
+      <div id="news-feed" class="news-feed">
+        <div class="glass" style="padding:26px;text-align:center;">Cargando noticias...</div>
+      </div>
+    </section>
+
+    <!-- VISTA 3: HISTORIAL DE RECARGAS -->
     <section id="view-history" class="view">
       <div class="section-header">
         <div>
@@ -65,7 +81,19 @@
       <div id="history-list" class="history-list"></div>
     </section>
 
-    <!-- VISTA 3: PANEL DE ADMINISTRACIÓN -->
+    <!-- VISTA 4: PERSONALIZACIÓN DE PERFIL -->
+    <section id="view-profile" class="view">
+      <div class="section-header">
+        <div>
+          <h2>Mi Perfil</h2>
+          <p class="muted">Personaliza tu foto y descripción gratis, o solicita un cambio de nombre ($5 USD).</p>
+        </div>
+        <button class="btn btn-outline" onclick="App.switchView('store')">← Volver a la tienda</button>
+      </div>
+      <div id="profile-container" class="profile-layout"></div>
+    </section>
+
+    <!-- VISTA 5: PANEL DE ADMINISTRACIÓN -->
     <section id="view-admin" class="view">
       <div class="section-header">
         <div>
@@ -73,15 +101,17 @@
           <p class="muted">Todos los cambios se guardan automáticamente en la nube (D1 + R2).</p>
         </div>
         <div class="row-actions">
-          <button class="btn btn-outline" onclick="App.refreshAdminOrders()">↻ Actualizar Pedidos</button>
+          <button class="btn btn-outline" onclick="App.refreshAdminData()">↻ Actualizar Datos</button>
           <button class="btn btn-danger" onclick="App.lockAdmin()">🔒 Bloquear Admin</button>
         </div>
       </div>
 
       <div class="admin-tabs">
         <button class="tab-btn active" data-tab="games" onclick="App.switchAdminTab('games')">Juegos y Paquetes</button>
+        <button class="tab-btn" data-tab="news" onclick="App.switchAdminTab('news')">Noticias</button>
         <button class="tab-btn" data-tab="payments" onclick="App.switchAdminTab('payments')">Pagos y Tasa</button>
         <button class="tab-btn" data-tab="orders" onclick="App.switchAdminTab('orders')">Pedidos</button>
+        <button class="tab-btn" data-tab="namechanges" onclick="App.switchAdminTab('namechanges')">Cambios de Nombre</button>
         <button class="tab-btn" data-tab="appearance" onclick="App.switchAdminTab('appearance')">Apariencia y Seguridad</button>
       </div>
 
@@ -107,6 +137,22 @@
       </div>
 
       <div id="checkout-body" class="checkout-body"></div>
+    </div>
+  </div>
+
+  <!-- MODAL: SOLICITUD DE CAMBIO DE NOMBRE ($5 USD) -->
+  <div id="modal-name-change" class="modal-backdrop">
+    <div class="modal glass checkout-modal">
+      <button class="modal-close" onclick="App.closeModal('modal-name-change')">✕</button>
+      <div id="name-change-modal-content" class="checkout-body"></div>
+    </div>
+  </div>
+
+  <!-- MODAL: PERFIL PÚBLICO DE OTRO USUARIO -->
+  <div id="modal-public-profile" class="modal-backdrop">
+    <div class="modal glass small-modal">
+      <button class="modal-close" onclick="App.closeModal('modal-public-profile')">✕</button>
+      <div id="public-profile-content"></div>
     </div>
   </div>
 
