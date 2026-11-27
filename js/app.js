@@ -117,6 +117,9 @@ const App = {
     zoneId: "",
     nickname: "",
     confirmedId: false,
+    verifyingId: false,
+    verifyStatus: null, // null | "ok" | "error" | "info"
+    verifyMessage: "",
     packageId: null,
     paymentId: null,
     promoInput: "",
@@ -2017,7 +2020,7 @@ const App = {
     return `https://wa.me/${phone}?text=${encodeURIComponent(text)}`;
   },
 
-  /* ================= CHECKOUT (LOGIN + CÓDIGO DESCUENTO/REFERIDO + CAPTURA + WHATSAPP) ================= */
+  /* ================= CHECKOUT (VERIFICACIÓN DE ID + CÓDIGO DESCUENTO/REFERIDO + CAPTURA + WHATSAPP) ================= */
   startCheckout(gameId) {
     if (!this.currentUser || !this.userToken) {
       this.pendingGameId = gameId;
@@ -2038,6 +2041,9 @@ const App = {
       zoneId: "",
       nickname: "",
       confirmedId: false,
+      verifyingId: false,
+      verifyStatus: null,
+      verifyMessage: "",
       packageId: game.packages[0]?.id || null,
       paymentId: this.state.payments.find(p => p.active)?.id || null,
       promoInput: "",
@@ -2058,6 +2064,69 @@ const App = {
 
     this.renderCheckoutStep();
     this.openModal("modal-checkout");
+  },
+
+  async verifyCheckoutId() {
+    const c = this.checkout;
+    const game = this.state.games.find(g => g.id === c.gameId);
+    if (!game || c.verifyingId) return;
+
+    const playerId = (document.getElementById("chk-player-id")?.value ?? c.playerId ?? "").trim();
+    const zoneId = game.needsZone
+      ? (document.getElementById("chk-zone-id")?.value ?? c.zoneId ?? "").trim()
+      : "";
+
+    c.playerId = playerId;
+    c.zoneId = zoneId;
+
+    if (!playerId) {
+      c.verifyStatus = "error";
+      c.verifyMessage = `Ingresa tu ${game.idLabel || "ID de Jugador"} antes de verificar.`;
+      this.renderCheckoutStep();
+      return;
+    }
+
+    if (game.needsZone && !zoneId) {
+      c.verifyStatus = "error";
+      c.verifyMessage = `Ingresa también tu ${game.zoneLabel || "Zone ID"} para verificar.`;
+      this.renderCheckoutStep();
+      return;
+    }
+
+    c.verifyingId = true;
+    c.verifyStatus = null;
+    c.verifyMessage = "";
+    this.renderCheckoutStep();
+
+    try {
+      const params = new URLSearchParams({ game: game.id, id: playerId });
+      if (zoneId) params.set("server", zoneId);
+
+      const res = await fetch(`/api/verify-id?${params.toString()}`);
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok || !data.ok) {
+        c.verifyStatus = data.unsupported ? "info" : "error";
+        c.verifyMessage = data.error || "No se pudo verificar el ID.";
+        if (data.unsupported) {
+          this.toast(c.verifyMessage);
+        }
+        return;
+      }
+
+      if (data.username) {
+        c.nickname = data.username;
+      }
+      c.verifyStatus = "ok";
+      c.verifyMessage = `Jugador verificado: ${data.username || playerId}`;
+      this.toast(`ID verificado: ${data.username}`);
+    } catch {
+      c.verifyStatus = "error";
+      c.verifyMessage = "Error de conexión al verificar el ID.";
+    } finally {
+      c.verifyingId = false;
+      this.renderCheckoutStep();
+    }
   },
 
   async applyPromoCode() {
@@ -2110,20 +2179,54 @@ const App = {
     });
 
     if (c.step === 1) {
+      const statusBox = c.verifyMessage
+        ? `<div class="pay-details-box" style="margin-top:10px;padding:10px 12px;border-color:${
+            c.verifyStatus === "ok"
+              ? "rgba(0,229,255,0.45)"
+              : c.verifyStatus === "info"
+              ? "rgba(255,255,255,0.16)"
+              : "rgba(255,77,109,0.5)"
+          };">
+            <span style="font-size:0.84rem;color:${
+              c.verifyStatus === "ok"
+                ? "var(--accent)"
+                : c.verifyStatus === "info"
+                ? "#e2e8f0"
+                : "#ff859b"
+            };">
+              ${c.verifyStatus === "ok" ? "✅ " : c.verifyStatus === "info" ? "ℹ️ " : "⚠️ "}${this.esc(c.verifyMessage)}
+            </span>
+          </div>`
+        : "";
+
       body.innerHTML = `
         <h4>Paso 1: Ingresa los datos de tu cuenta</h4>
         <p class="muted" style="font-size:0.86rem;margin-top:4px;">Verifica bien tu ID antes de continuar.</p>
 
         <label class="field-label">${this.esc(game.idLabel || "ID de Jugador")} *</label>
-        <input type="text" id="chk-player-id" class="input" value="${this.esc(c.playerId)}" placeholder="Ej: 318948769" />
+        <div style="display:flex;gap:8px;align-items:center;">
+          <input type="text" id="chk-player-id" class="input" value="${this.esc(c.playerId)}"
+            oninput="App.checkout.playerId = this.value; App.checkout.verifyStatus = null; App.checkout.verifyMessage = '';"
+            placeholder="Ej: 318948769" />
+          <button type="button" class="btn btn-outline btn-sm" style="white-space:nowrap;padding:10px 14px;"
+            onclick="App.verifyCheckoutId()" ${c.verifyingId ? "disabled" : ""}>
+            ${c.verifyingId ? "Buscando..." : "🔍 Verificar ID"}
+          </button>
+        </div>
 
         ${game.needsZone ? `
           <label class="field-label">${this.esc(game.zoneLabel || "Zone ID")} *</label>
-          <input type="text" id="chk-zone-id" class="input" value="${this.esc(c.zoneId)}" placeholder="Ej: 1002" />
+          <input type="text" id="chk-zone-id" class="input" value="${this.esc(c.zoneId)}"
+            oninput="App.checkout.zoneId = this.value; App.checkout.verifyStatus = null; App.checkout.verifyMessage = '';"
+            placeholder="Ej: 1002" />
         ` : ""}
 
+        ${statusBox}
+
         <label class="field-label">Nombre en el juego (opcional)</label>
-        <input type="text" id="chk-nickname" class="input" value="${this.esc(c.nickname)}" placeholder="Tu apodo dentro del juego" />
+        <input type="text" id="chk-nickname" class="input" value="${this.esc(c.nickname)}"
+          oninput="App.checkout.nickname = this.value"
+          placeholder="Se rellena al verificar o escríbelo tú" />
 
         <label class="checkbox-card">
           <input type="checkbox" id="chk-confirm-id" ${c.confirmedId ? "checked" : ""} />
@@ -2253,6 +2356,7 @@ const App = {
           <div><strong>Juego:</strong> ${this.esc(o.game_name)}</div>
           <div><strong>Paquete:</strong> ${this.esc(o.package_name)}</div>
           <div><strong>ID Jugador:</strong> ${this.esc(o.player_id)}${o.zone_id ? ` (Zona: ${this.esc(o.zone_id)})` : ""}</div>
+          ${o.nickname ? `<div><strong>Nickname:</strong> ${this.esc(o.nickname)}</div>` : ""}
           <div><strong>Pago:</strong> ${this.esc(o.payment_name)} — Ref: <strong>${this.esc(o.reference)}</strong></div>
           ${o.promo_code ? `<div><strong>Código:</strong> ${this.esc(o.promo_code)}${o.discount_usd > 0 ? ` (-${this.formatUsd(o.discount_usd)})` : ""}</div>` : ""}
           <div><strong>Monto:</strong> ${this.esc(o.amount_display)}</div>
