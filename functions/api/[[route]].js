@@ -628,6 +628,190 @@ async function createAndPushNotification(env, {
   return notification;
 }
 
+/* ================= VERIFICADOR DE ID DE JUEGOS (RAPIDAPI + ROBLOX + D1 CACHE) ================= */
+const GAME_ALIASES = {
+  "mlbb": "mobile-legends",
+  "mobile-legends": "mobile-legends",
+  "mobilelegends": "mobile-legends",
+  "freefire": "free-fire",
+  "free-fire": "free-fire",
+  "ff": "free-fire",
+  "bloodstrike": "blood-strike",
+  "blood-strike": "blood-strike",
+  "roblox": "roblox",
+  "honor-of-kings": "honor-of-kings",
+  "honorofkings": "honor-of-kings",
+  "hok": "honor-of-kings",
+  "valorant": "valorant",
+  "pubgm": "pubgm-global",
+  "pubgm-global": "pubgm-global",
+  "pubg": "pubgm-global",
+  "pubgm-lite": "pubgm-lite",
+  "pubgmlite": "pubgm-lite",
+  "genshin": "genshin",
+  "genshin-impact": "genshin",
+  "arena-of-valor": "arena-of-valor",
+  "aov": "arena-of-valor",
+  "delta-force": "delta-force",
+  "deltaforce": "delta-force",
+  "dfm": "delta-force",
+  "arena-breakout": "arena-breakout",
+  "arenabreakout": "arena-breakout",
+  "magic-chess": "magic-chess",
+  "magicchess": "magic-chess",
+  "mcgg": "magic-chess"
+};
+
+const RAPIDAPI_GAMES = {
+  "blood-strike":    (id) => `/blood-strike/${encodeURIComponent(id)}`,
+  "honor-of-kings":  (id) => `/honor-of-kings/${encodeURIComponent(id)}`,
+  "valorant":        (id, server) => `/valorant/${encodeURIComponent(id)}/${encodeURIComponent(server)}`,
+  "pubgm-global":    (id) => `/pubgm-global/${encodeURIComponent(id)}`,
+  "pubgm-lite":      (id) => `/pubgm-lite/${encodeURIComponent(id)}`,
+  "genshin":         (id, server) => `/genshin/${encodeURIComponent(id)}/${encodeURIComponent(server)}`,
+  "arena-of-valor":  (id) => `/arena-of-valor/${encodeURIComponent(id)}`,
+  "delta-force":     (id) => `/dfm-garena/${encodeURIComponent(id)}`,
+  "arena-breakout":  (id) => `/arena-breakout/${encodeURIComponent(id)}`,
+  "magic-chess":     (id, server) => `/mcgg/${encodeURIComponent(id)}/${encodeURIComponent(server)}`,
+  "free-fire":       (id) => `/ff-global/${encodeURIComponent(id)}`,
+  "mobile-legends":  (id, server) => `/mobile-legends/${encodeURIComponent(id)}/${encodeURIComponent(server)}`
+};
+
+const REQUIRES_SERVER_GAMES = new Set(["valorant", "genshin", "magic-chess", "mobile-legends"]);
+const ID_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+async function saveIdCheckCache(env, cacheKey, username, extra, now) {
+  if (!env.DB) return;
+  try {
+    await env.DB.prepare(`
+      INSERT INTO id_check_cache (cache_key, username, extra_info, updated_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(cache_key) DO UPDATE SET
+        username = excluded.username,
+        extra_info = excluded.extra_info,
+        updated_at = excluded.updated_at
+    `).bind(cacheKey, username, JSON.stringify(extra || {}), now).run();
+  } catch {
+    // No rompe la respuesta si falla el guardado en caché
+  }
+}
+
+async function handleVerifyGameId(request, env) {
+  const url = new URL(request.url);
+  const rawGame = (url.searchParams.get("game") || "").toLowerCase().trim();
+  const id = (url.searchParams.get("id") || "").trim();
+  const server = (url.searchParams.get("server") || "").trim();
+
+  if (!rawGame || !id) {
+    return json({ ok: false, error: "Ingresa tu ID de jugador para verificar." }, 400);
+  }
+
+  const game = GAME_ALIASES[rawGame];
+  if (!game) {
+    return json({ ok: false, unsupported: true, error: "Este juego no requiere verificación automática." }, 200);
+  }
+
+  if (REQUIRES_SERVER_GAMES.has(game) && !server) {
+    return json({ ok: false, error: "Este juego también requiere el Zone ID / Servidor." }, 400);
+  }
+
+  const cacheKey = `${game}:${id.toLowerCase()}:${server.toLowerCase()}`;
+  const now = Date.now();
+
+  // 1. Buscar primero en caché D1 (24 horas)
+  if (env.DB) {
+    const cached = await env.DB.prepare(
+      "SELECT username, extra_info, updated_at FROM id_check_cache WHERE cache_key = ?"
+    ).bind(cacheKey).first();
+
+    if (cached && (now - Number(cached.updated_at)) < ID_CACHE_TTL_MS) {
+      return json({
+        ok: true,
+        cached: true,
+        username: cached.username,
+        extra: cached.extra_info ? JSON.parse(cached.extra_info) : null
+      });
+    }
+  }
+
+  // 2. Roblox vía API oficial gratuita
+  if (game === "roblox") {
+    const isNumeric = /^\d+$/.test(id);
+    let username = null;
+    let extra = {};
+
+    if (isNumeric) {
+      const res = await fetch(`https://users.roblox.com/v1/users/${id}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data?.name) {
+          username = data.displayName && data.displayName !== data.name
+            ? `${data.displayName} (@${data.name})`
+            : data.name;
+          extra = { id: data.id, name: data.name };
+        }
+      }
+    } else {
+      const res = await fetch("https://users.roblox.com/v1/usernames/users", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ usernames: [id], excludeBannedUsers: false })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const user = data?.data?.[0];
+        if (user?.name) {
+          username = user.displayName && user.displayName !== user.name
+            ? `${user.displayName} (@${user.name})`
+            : user.name;
+          extra = { id: user.id, name: user.name };
+        }
+      }
+    }
+
+    if (!username) {
+      return json({ ok: false, error: "Usuario de Roblox no encontrado." }, 404);
+    }
+
+    await saveIdCheckCache(env, cacheKey, username, extra, now);
+    return json({ ok: true, cached: false, username, extra });
+  }
+
+  // 3. Resto de juegos vía RapidAPI (NeferByte)
+  if (!env.RAPIDAPI_KEY) {
+    return json({ ok: false, error: "Falta configurar RAPIDAPI_KEY en Cloudflare." }, 503);
+  }
+
+  const buildPath = RAPIDAPI_GAMES[game];
+  const rapidUrl = `https://id-game-checker.p.rapidapi.com${buildPath(id, server)}`;
+  const res = await fetch(rapidUrl, {
+    method: "GET",
+    headers: {
+      "x-rapidapi-host": "id-game-checker.p.rapidapi.com",
+      "x-rapidapi-key": env.RAPIDAPI_KEY
+    }
+  });
+
+  if (!res.ok) {
+    return json({ ok: false, error: "No se pudo verificar el ID en este momento." }, res.status === 404 ? 404 : 502);
+  }
+
+  const data = await res.json().catch(() => null);
+  if (!data || data.error || !data.data?.username) {
+    return json({ ok: false, error: "ID no encontrado. Revisa que los datos sean correctos." }, 404);
+  }
+
+  const username = String(data.data.username);
+  const extra = {
+    region: data.data.region || null,
+    is_ban: data.data.is_ban ?? null,
+    level: data.data.player_info?.level || null
+  };
+
+  await saveIdCheckCache(env, cacheKey, username, extra, now);
+  return json({ ok: true, cached: false, username, extra });
+}
+
 /* ================= HANDLER PRINCIPAL ================= */
 export async function onRequest(context) {
   const { request, env, params } = context;
@@ -774,6 +958,11 @@ export async function onRequest(context) {
         discountUsd: result.discountUsd,
         finalPriceUsd: result.finalPriceUsd
       });
+    }
+
+    /* 2.7 VERIFICAR ID DE JUGADOR EN TIEMPO REAL */
+    if (method === "GET" && path === "verify-id") {
+      return await handleVerifyGameId(request, env);
     }
 
     /* 3. AUTENTICACIÓN DE USUARIOS */
