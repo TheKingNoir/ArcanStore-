@@ -461,7 +461,7 @@ body {
 /* Paquetes */
 .packages-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
   margin: 14px 0 18px;
 }
@@ -474,6 +474,7 @@ body {
   cursor: pointer;
   text-align: center;
   transition: 0.2s;
+  min-width: 0;
 }
 .pkg-card:hover, .pkg-card.selected {
   border-color: var(--accent);
@@ -487,7 +488,7 @@ body {
   margin: 0 auto 8px;
   display: block;
 }
-.pkg-name { font-weight: 600; font-size: 0.88rem; margin-bottom: 4px; }
+.pkg-name { font-weight: 600; font-size: 0.88rem; margin-bottom: 4px; word-break: break-word; }
 .pkg-usd { color: var(--accent); font-weight: 700; font-size: 1rem; }
 .pkg-bs { font-size: 0.76rem; color: var(--muted); }
 
@@ -1782,6 +1783,11 @@ body {
 @media (max-width: 640px) {
   .hero { padding: 20px; }
   .stepper { font-size: 0.7rem; padding: 10px; }
+  .packages-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+  .pkg-card { padding: 10px 8px; }
+  .pkg-card img { width: 52px; height: 52px; }
+  .pkg-name { font-size: 0.82rem; }
+  .pkg-usd { font-size: 0.94rem; }
   .pay-methods { grid-template-columns: 1fr; }
   .profile-card { padding: 18px; }
   .profile-top { flex-direction: column; align-items: stretch; }
